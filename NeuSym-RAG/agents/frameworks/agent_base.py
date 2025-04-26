@@ -7,6 +7,7 @@ from agents.envs.actions import Action, Observation
 from agents.models import LLMClient
 from utils.functions.common_functions import truncate_tokens
 from typing import List, Dict, Any, Union, Tuple, Optional
+import collections
 
 
 logger = logging.getLogger(__name__)
@@ -14,11 +15,12 @@ logger = logging.getLogger(__name__)
 
 class AgentBase(ABC):
 
-    def __init__(self, model: LLMClient, env: AgentEnv, agent_method: Optional[str] = None, max_turn: int = 10):
+    def __init__(self, model: LLMClient, env: AgentEnv, agent_method: Optional[str] = None, max_turn: int = 10, use_consistency_selection: bool = False, consistency_N: int = 5):
         self.model, self.env = model, env
         self.agent_method, self.max_turn = agent_method, max_turn
         self.agent_prompt, self.system_prompt = '', ''
-
+        self.use_consistency_selection = use_consistency_selection
+        self.consistency_N = consistency_N
 
     def close(self):
         self.env.close()
@@ -29,6 +31,52 @@ class AgentBase(ABC):
     def interact(self, *args, **kwargs) -> str:
         pass
 
+    def get_most_consistent_action(self, candidate_actions: List[Action]) -> Action:
+        if len(candidate_actions) == 1:
+            return candidate_actions[0]
+        
+        action_types = [action.action_type for action in candidate_actions]
+        type_counter = collections.Counter(action_types)
+        most_common_type, _ = type_counter.most_common(1)[0]
+
+        # filter the candidate actions by the most common type
+        actions_of_most_common_type = [action for action in candidate_actions if action.action_type == most_common_type]
+
+        if len(actions_of_most_common_type) == 1:
+            return actions_of_most_common_type[0]
+
+        param_combinations = []
+        action_by_params = {}
+        for action in actions_of_most_common_type:
+            params = {}
+            if action.action_type == "RetrieveFromDatabase":
+                params["sql"] = action.parameters["sql"]
+            elif action.action_type == "RetrieveFromVectorstore":
+                params["query"] = action.parameters["query"]
+                params["collection_name"] = action.parameters["collection_name"]
+                params["table_name"] = action.parameters["table_name"]
+                params["column_name"] = action.parameters["column_name"]
+                params["filter"] = action.parameters["filter"]  
+                params["limit"] = action.parameters["limit"]
+            elif action.action_type == "CalculateExpr":
+                params["expr"] = action.parameters["expr"]
+            elif action.action_type == "ViewImage":
+                params["paper_id"] = action.parameters["paper_id"]
+                params["page_number"] = action.parameters["page_number"]
+                params["bounding_box"] = action.parameters["bounding_box"]
+            elif action.action_type == "GenerateAnswer":
+                params["answer"] = action.parameters["answer"]
+            param_str = json.dumps(params, sort_keys=True)
+            param_combinations.append(param_str)
+
+            # store the map of param_str to action
+            if param_str not in action_by_params:
+                action_by_params[param_str] = action
+        
+        param_counter = collections.Counter(param_combinations)
+        most_common_param, _ = param_counter.most_common(1)[0]
+
+        return action_by_params[most_common_param]
 
     def forward(self, messages: List[Dict[str, Any]], model: str = '', temperature: float = 0.7, top_p: float = 0.95, max_tokens: int = 1500, window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}) -> str:
         prev_cost = self.model.get_cost()
@@ -44,8 +92,13 @@ class AgentBase(ABC):
             response = self.model.get_response(current_messages, model=model, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
             logger.debug(f'[Response]: {response}')
 
-            obs, reward, flag, info = self.env.step(response, **output_kwargs)
-            action: Action = self.env.parsed_actions[-1]
+            iter = 1 if self.use_consistency_selection else self.consistency_N
+            for _ in range(iter):
+                obs, reward, flag, info = self.env.step(response, **output_kwargs)
+            candidate_actions : List[Action] = self.env.parsed_actions[-iter:]
+            # clean the last iter_num actions, and only keep the most consistent action
+            action: Action = self.get_most_consistent_action(candidate_actions)
+            self.env.parsed_actions = self.env.parsed_actions[:-iter].append(action)
             action_msg = action.convert_to_message(self.env.action_format, self.env.interact_protocol)
             logger.info(action_msg['content'])
 
