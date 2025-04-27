@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict, deque
 from collections.abc import Sized
 from contextlib import nullcontext
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, List, Dict, Tuple
 
 import datasets
 import torch
