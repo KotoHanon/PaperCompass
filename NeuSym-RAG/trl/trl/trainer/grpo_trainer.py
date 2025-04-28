@@ -25,6 +25,7 @@ import datasets
 import torch
 import torch.utils.data
 import transformers
+from torch.nn.utils.rnn import pad_sequence
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -372,6 +373,17 @@ class GRPOTrainer(Trainer):
         peft_config: Optional["PeftConfig"] = None,
         agent_method: str = 'neusym_rag',
         max_turn: int = 20,
+        dataset: str = 'airqa',
+        database: str = 'ai_research',
+        vectorstore: str = 'airqa',
+        database_path: str = './data/airqa_db',
+        vectorstore_path: str = './data/airqa_vs',
+        launch_method: str = 'local',
+        docker_uri: str = None,
+        action_format: str = 'json',
+        interact_protocol: str = 'chat',
+        vs_format: str = 'detailed_json',
+        db_format: str = 'create_sql',
     ):
         # Args
         if args is None:
@@ -496,18 +508,21 @@ class GRPOTrainer(Trainer):
             return features
         
         # LLM, env, agent
-        self.env: AgentEnv = infer_env_class(args.agent_method)(
-            dataset=args.dataset,
-            action_format=args.action_format,
-            interact_protocol=args.interact_protocol,
-            database=args.database,
-            vectorstore=args.vectorstore,
-            database_path=args.database_path,
-            launch_method=args.launch_method,
-            vectorstore_path=args.vectorstore_path,
-            docker_uri=args.docker_uri
+        self.env: AgentEnv = infer_env_class('neusym_rag')(
+            dataset=dataset,
+            action_format=action_format,
+            interact_protocol=interact_protocol,
+            database=database,
+            vectorstore=vectorstore,
+            database_path=database_path,
+            launch_method=launch_method,
+            vectorstore_path=vectorstore_path,
+            docker_uri=docker_uri
         )
-        self.agent: AgentBase = infer_agent_class(args.agent_method)(model, self.env, agent_method=args.agent_method, max_turn=args.max_turn)
+        self.max_turn = max_turn
+        self.agent_method = agent_method
+        self.dataset = dataset
+        self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
@@ -523,13 +538,16 @@ class GRPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
+        self.use_consistency_selection = False
+        self.consistency_N = 3
+        self.max_turn = max_turn
         self.agent_prompt = AGENT_PROMPTS[agent_method].format(
             system_prompt=SYSTEM_PROMPTS[agent_method],
             action_space_prompt=self.env.action_space_prompt,
             hint_prompt=HINT_PROMPTS[agent_method],
             max_turn=max_turn
         )
-        task_prompt, image_messages = formulate_input(args.dataset, args.example, use_pdf_id=True)
+        '''task_prompt, image_messages = formulate_input(dataset, example, use_pdf_id=True)
         task_prompt = "\n".join([
             task_prompt,
             f"[Database Schema]: {self.database_prompt}",
@@ -540,13 +558,22 @@ class GRPOTrainer(Trainer):
         self.messages = [
             {'role': 'system', 'content': self.agent_prompt},
             {'role': 'user', 'content': task_prompt}
-        ]
+        ]'''
         logger.info(f'[Agent Prompt]: {self.agent_prompt}')
 
         # Datasets
+        self.database = database
+        self.vectorstore = vectorstore
+        self.db_format = db_format
+        self.vs_format = vs_format
+        self.database_prompt = convert_database_schema_to_prompt(self.database, serialize_method=self.db_format)
+        self.vectorstore_prompt = convert_vectorstore_schema_to_prompt(self.vectorstore, serialize_method=self.vs_format, add_description=False)
+
+        self.messages = [
+            {'role': 'system', 'content': "Test"},
+            {'role': 'user', 'content': "What is the capital of France?"}
+        ]
         self.shuffle_dataset = args.shuffle_dataset
-        self.database_prompt = convert_database_schema_to_prompt(args.database, serialize_method=args.db_format)
-        self.vectorstore_prompt = convert_vectorstore_schema_to_prompt(args.vectorstore, serialize_method=args.vs_format, add_description=False)
 
         if (
             isinstance(train_dataset, IterableDataset)
@@ -615,7 +642,8 @@ class GRPOTrainer(Trainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
-        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
+        #self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
+        self.wandb_log_unique_prompts = True
         self.num_completions_to_print = args.num_completions_to_print
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
@@ -1022,9 +1050,36 @@ class GRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]'''
+            #print(prompts_text)
 
-            completions_text, prompt_completion_ids, completion_ids = self.forward(self.messages) # 使用GRPO的生成方法替代model.get_response
+            # TODO: 需要修改，因为inputs[0]是字典，而不是example。这里只是占位用于前向debug
+            prompt_completion_idss = []
+            completion_idss = []
+            for example in inputs:
+                task_prompt, image_messages = formulate_input(self.dataset, example, use_pdf_id=True)
+                task_prompt = "\n".join([
+                    task_prompt,
+                    f"[Database Schema]: {self.database_prompt}",
+                    f"[Vectorstore Schema]: {self.vectorstore_prompt}"
+                ])
+                if image_messages:
+                    task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
+                self.messages = [
+                    {'role': 'system', 'content': self.agent_prompt},
+                    {'role': 'user', 'content': task_prompt}
+                ]
+                completions_text, prompt_completion_ids, completion_ids = self.forward(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
+                prompt_completion_idss.append(prompt_completion_ids)
+                completion_idss.append(completion_ids)
+            
+            # 对prompt_completion_idss和completion_idss进行padding
+            seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in prompt_completion_idss]
+            padded_prompt_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
+            prompt_completion_ids = padded_prompt_completion_ids
 
+            seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in completion_idss]
+            padded_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
+            completion_ids = padded_completion_ids
         # 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
         # 因此需要找到每个response的eos，并将其作为结束标志。只留下最后的eos以便后续的处理
 
@@ -1035,13 +1090,32 @@ class GRPOTrainer(Trainer):
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+        # 创建用于模型前向传播的 attention_mask
+        # 修改：拼接 prompt_mask 和 completion_mask 的副本，并处理两者长度与 prompt_completion_ids 一致
+        attention_prompt_mask = prompt_mask
+        attention_completion_mask = completion_mask.clone()
+
+        # 调整 prompt_mask 和 completion_mask 以适应 prompt_completion_ids 的长度
+        prompt_completion_len = prompt_completion_ids.size(1)
+        prompt_len = prompt_ids.size(1)
+        completion_len = completion_ids.size(1)
+
+        if prompt_len + completion_len != prompt_completion_len:
+            # 如果长度不一致，可能需要填充或截断
+            if prompt_len + completion_len < prompt_completion_len:
+                # 需要填充
+                pad_len = prompt_completion_len - (prompt_len + completion_len)
+                attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (0, pad_len), value=0)
+            else:
+                # 需要截断
+                attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]
+
+        # 拼接 attention_mask
+        attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
@@ -1237,8 +1311,8 @@ class GRPOTrainer(Trainer):
 
         return action_by_params[most_common_param]
     
-    def forward(self, messages: List[Dict[str, Any]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}) -> str:
-        prev_cost = self.model.get_cost()
+    def forward(self, messages: List[Dict[str, Any]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5) -> str:
+        # prev_cost = self.model.get_cost()
         self.env.reset()
         true_prompt_completion_ids = []
         true_completion_ids = []
@@ -1250,7 +1324,7 @@ class GRPOTrainer(Trainer):
 
             logger.info(f'[Interaction Turn]: {turn + 1}')
 
-            iter = 1 if self.use_consistency_selection else self.consistency_N
+            iter = 1 if use_consistency_selection else consistency_N
             responses = []
             prompt_completion_idss = []
             completion_idss = []
@@ -1300,9 +1374,11 @@ class GRPOTrainer(Trainer):
                 "idx": i,
                 "action": self.env.parsed_actions[-i:]
             } for i in range(iter)]
-            self.env.parsed_actions[-iter:]
             # clean the last iter_num actions, and only keep the most consistent action
-            action: Action = self.get_most_consistent_action(candidate_actions)[0]
+            # TODO: 需要解决self.get_most_consistent_action(candidate_actions)[0]返回的是一个元组，而不是一个Action的问题
+            action: Action = self.get_most_consistent_action(candidate_actions)[0][0]
+            self.env.parsed_actions = self.env.parsed_actions[:-iter]
+            self.env.parsed_actions.append(action)
             # get the response of the most consistent action by index
             response = responses[self.get_most_consistent_action(candidate_actions)[1]]
             true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
@@ -1310,7 +1386,8 @@ class GRPOTrainer(Trainer):
 
             logger.debug(f'[Response]: {response}')
 
-            self.env.parsed_actions = self.env.parsed_actions[:-iter].append(action)
+            self.env.parsed_actions = self.env.parsed_actions[:-iter]
+            self.env.parsed_actions.append(action)
             action_msg = action.convert_to_message(self.env.action_format, self.env.interact_protocol)
             logger.info(action_msg['content'])
 
@@ -1328,22 +1405,21 @@ class GRPOTrainer(Trainer):
             messages.append(obs_msg)
 
             if flag: # whether task is completed
-                cost = self.model.get_cost() - prev_cost
-                logger.info(f'[Info]: early stop at interaction turn {turn + 1}, cost ${cost:.6f}.')
+                #cost = self.model.get_cost() - prev_cost
+                #logger.info(f'[Info]: early stop at interaction turn {turn + 1}, cost ${cost:.6f}.')
                 break
         else:
-            cost = self.model.get_cost() - prev_cost
-            logger.info(f'[Warning]: exceeds the maximum interaction turn {self.max_turn}, cost ${cost:.6f}.')
+            #cost = self.model.get_cost() - prev_cost
+            #logger.info(f'[Warning]: exceeds the maximum interaction turn {self.max_turn}, cost ${cost:.6f}.')
+            pass
         if output_path is not None:
             with open(output_path, 'w', encoding='utf-8') as f:
                 for m in messages:
                     f.write(json.dumps(m, ensure_ascii=False) + '\n')
-        
-        # 展开为一维列表
         if true_prompt_completion_ids:
             # 如果列表非空，将所有张量拼接为一个大张量
-            flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=0)
-            flattened_completion_ids = torch.cat(true_completion_ids, dim=0)
+            flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=1)
+            flattened_completion_ids = torch.cat(true_completion_ids, dim=1)
         else:
             # 如果列表为空，创建空张量
             flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
