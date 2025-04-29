@@ -20,7 +20,7 @@ from collections import defaultdict, deque
 from collections.abc import Sized
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Union, List, Dict, Tuple
-
+import copy
 import datasets
 import torch
 import torch.utils.data
@@ -376,14 +376,16 @@ class GRPOTrainer(Trainer):
         dataset: str = 'airqa',
         database: str = 'ai_research',
         vectorstore: str = 'airqa',
-        database_path: str = './data/airqa_db',
-        vectorstore_path: str = './data/airqa_vs',
-        launch_method: str = 'local',
+        launch_method: str = 'standalone',
         docker_uri: str = None,
         action_format: str = 'json',
-        interact_protocol: str = 'chat',
+        interact_protocol: str = 'react',
         vs_format: str = 'detailed_json',
         db_format: str = 'create_sql',
+        image_limit: int = 10,
+        length_limit: int = 32,
+        database_path: str = None,
+        vectorstore_path: str = None,
     ):
         # Args
         if args is None:
@@ -541,6 +543,7 @@ class GRPOTrainer(Trainer):
         self.use_consistency_selection = False
         self.consistency_N = 3
         self.max_turn = max_turn
+        self.image_limit, self.length_limit = image_limit, length_limit
         self.agent_prompt = AGENT_PROMPTS[agent_method].format(
             system_prompt=SYSTEM_PROMPTS[agent_method],
             action_space_prompt=self.env.action_space_prompt,
@@ -1069,6 +1072,7 @@ class GRPOTrainer(Trainer):
                     {'role': 'user', 'content': task_prompt}
                 ]
                 completions_text, prompt_completion_ids, completion_ids = self.forward(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
+                # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的”答案“
                 prompt_completion_idss.append(prompt_completion_ids)
                 completion_idss.append(completion_ids)
             
@@ -1083,19 +1087,22 @@ class GRPOTrainer(Trainer):
         # 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
         # 因此需要找到每个response的eos，并将其作为结束标志。只留下最后的eos以便后续的处理
 
-        # Mask everything after the first EOS token
+        # mask掉两个内容：1. 第一个eos之后的token； 2. 是pad的token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        eos_position_mask = sequence_indices <= eos_idx.unsqueeze(1)
+        non_padding_mask = completion_ids != self.processing_class.pad_token_id
+        combined_mask = eos_position_mask & non_padding_mask
+        completion_mask = combined_mask.int()
 
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
         # 创建用于模型前向传播的 attention_mask
-        # 修改：拼接 prompt_mask 和 completion_mask 的副本，并处理两者长度与 prompt_completion_ids 一致
+        # 修改：拼接 prompt_mask 和 completion_mask 的副本，并处理两者长度与prompt_completion_ids 一致
         attention_prompt_mask = prompt_mask
         attention_completion_mask = completion_mask.clone()
 
@@ -1330,7 +1337,9 @@ class GRPOTrainer(Trainer):
             completion_idss = []
             for _ in range(iter):
                 # 使用GRPO的生成方法替代model.get_response
-                prompt_text = maybe_apply_chat_template({"prompt": current_messages}, self.processing_class)["prompt"]
+                # 参考Agent框架里面的convert_message_from_gpt_format，做出裁剪。
+                messages = self.convert_message_from_gpt_format(messages=current_messages)
+                prompt_text = maybe_apply_chat_template({"prompt": messages}, self.processing_class)["prompt"]
                 prompt_inputs = self.processing_class(
                     text=[prompt_text], return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
                 )
@@ -1351,15 +1360,6 @@ class GRPOTrainer(Trainer):
 
                 prompt_length = prompt_ids.size(1)
                 completion_ids = prompt_completion_ids[:, prompt_length:]
-                
-                # 处理completion_ids，只保留最后一个EOS标记（因为是多次回答拼接成完整的traj）
-                for i in range(completion_ids.size(0)):
-                    # 找出当前序列中所有EOS标记的位置
-                    eos_positions = (completion_ids[i] == self.processing_class.eos_token_id).nonzero(as_tuple=True)[0]
-                    if len(eos_positions) > 1:  # 如果有多个EOS标记
-                        # 仅保留最后一个EOS标记，其他的替换为PAD标记
-                        for pos in eos_positions[:-1]:  # 除了最后一个EOS以外都替换
-                            completion_ids[i, pos] = self.processing_class.pad_token_id
                 
                 completion_idss.append(completion_ids)
                 completion_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
@@ -1384,9 +1384,6 @@ class GRPOTrainer(Trainer):
             true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
 
             logger.debug(f'[Response]: {response}')
-
-            self.env.parsed_actions = self.env.parsed_actions[:-iter]
-            self.env.parsed_actions.append(action)
             action_msg = action.convert_to_message(self.env.action_format, self.env.interact_protocol)
             logger.info(action_msg['content'])
 
@@ -1424,11 +1421,102 @@ class GRPOTrainer(Trainer):
             flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
             flattened_completion_ids = torch.tensor([], device=self.accelerator.device)
             
+        # 处理flattened张量中的EOS标记，只保留最后一个
+        def replace_all_but_last_eos(tensor, eos_token_id, pad_token_id):
+            """只保留张量中最后一个EOS标记，其他EOS标记替换为PAD标记"""
+            if tensor.dim() == 2 and tensor.size(0) == 1:  # 确保是[1, seq_len]形状
+                # 找出所有EOS标记的位置
+                eos_positions = (tensor[0] == eos_token_id).nonzero(as_tuple=True)[0]
+                if len(eos_positions) > 1:  # 如果有多个EOS标记
+                    # 仅保留最后一个EOS标记，其他的替换为PAD标记
+                    for pos in eos_positions[:-1]:
+                        tensor[0, pos] = pad_token_id
+            return tensor
+        
+        # 应用EOS替换函数
+        if flattened_prompt_completion_ids.numel() > 0:
+            flattened_prompt_completion_ids = replace_all_but_last_eos(
+                flattened_prompt_completion_ids, 
+                self.processing_class.eos_token_id, 
+                self.processing_class.pad_token_id
+            )
+        
+        if flattened_completion_ids.numel() > 0:
+            flattened_completion_ids = replace_all_but_last_eos(
+                flattened_completion_ids, 
+                self.processing_class.eos_token_id, 
+                self.processing_class.pad_token_id
+            )
+            
         return truncate_tokens(str(obs.obs_content)), flattened_prompt_completion_ids, flattened_completion_ids # 需要注意padding
-    
-    
-    
 
+    def crop_image_count_in_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        image_limit: int = 10,
+        keep_msg: int = 2,
+        in_place: bool = False
+    ) -> List[Dict[str, Any]]:
+        """ Crop the image count in the messages.
+        @param
+            messages: the messages to be cropped.
+            image_limit: the maximum number of images to be kept.
+            keep_msg: the number of preceding messages to keep the images.
+            in_place: whether to modify the messages in place.
+        @return
+            the cropped messages.
+        """
+        image_count = 0
+        if not in_place: messages = copy.deepcopy(messages)
+
+        # images in the first two messages are maintained in the original order (usually system/task prompt)
+        for i in range(min(keep_msg, len(messages))):
+            if isinstance(messages[i]['content'], list):
+                for msg in messages[i]['content']:
+                    if msg['type'] == 'image_url':
+                        image_count += 1
+                        if image_count > image_limit:
+                            msg['type'] = 'text'
+                            if 'image_url' in msg: del msg['image_url']
+                            msg['text'] = f'The image stream is omitted due to the incapability of handling >{image_limit} images.'
+
+        # images in the rest messages are preserved in the reverse order
+        for msg in reversed(messages[keep_msg:]):
+            if isinstance(msg['content'], list):
+                for msg_dict in msg['content'][::-1]:
+                    if msg_dict['type'] == 'image_url':
+                        image_count += 1
+                        if image_count > image_limit:
+                            msg_dict['type'] = 'text'
+                            if 'image_url' in msg_dict: del msg_dict['image_url']
+                            msg_dict['text'] = f'The image stream is omitted due to the incapability of handling >{image_limit} images.'
+        return messages
+
+    def convert_message_from_gpt_format(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """ For VLLM-deployed open-source models, there are some limitations on:
+        1. the input prompt length (e.g., 32k tokens)
+        2. the number of images in the prompt (e.g., only one image)
+        """
+        keep_msg = 2 # one system message and one task message
+        messages = self.crop_image_count_in_messages(messages=messages, image_limit=self.image_limit, keep_msg=keep_msg, in_place=True)
+
+        if len(messages) > keep_msg:
+            message_max_tokens = min(self.length_limit * 1000, self.processing_class.model_max_length) # by default, qwen2.5-72b-instruct is 32k
+
+            truncated_messages = messages[:keep_msg]
+            current_tokens = sum(len(self.processing_class.encode(str(message))) for message in truncated_messages)
+            for i in range(len(messages) - 1, keep_msg - 1, -2):
+                pair = messages[i-1:i+1]
+                pair_tokens = sum(len(self.processing_class.encode(str(message))) for message in pair)
+                if current_tokens + pair_tokens > message_max_tokens:
+                    break
+                truncated_messages.insert(keep_msg, pair[1])
+                truncated_messages.insert(keep_msg, pair[0])
+                current_tokens += pair_tokens
+            messages = truncated_messages
+
+        return messages
+    
     def compute_liger_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]

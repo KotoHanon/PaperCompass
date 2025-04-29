@@ -31,79 +31,45 @@ args.launch_method = "standalone"
 args.docker_uri = None 
 args.max_turn = 5
 args.example = "airqa_example"
-args.db_format = "text"
-args.vs_format = "text"
+args.db_format = "create_sql"
+args.vs_format = "detailed_json"
 
-def problem_reward(completions, answers, **kwargs):
-    """Reward function for math problems with verifiable answers
-    completions: list of completions to evaluate
-    answers: list of answers to the problems from the dataset
-    """
 
-    rewards = []
-    for completion, correct_answer in zip(completions, answers):
-        # Extract the answer from the completion
-        try:
-            # This is a simplified example - you'd need proper parsing
-            answer = completion
-            # Binary reward: 1 for correct, 0 for incorrect
-            reward = 1.0 if answer == correct_answer else 0.0
-            rewards.append(reward)
-        except:
-            # If we can't parse an answer, give a low reward
-            rewards.append(0.0)
+def fuzzy_match_reward(completions, answers, fuzz_method='ratio', threshold=80, ignore_blank=True, lowercase=True, use_threshold=False, **kwargs):
 
-    return rewards
-
-def fuzzy_match_reward(completions, answers, fuzz_method='ratio', threshold=80, ignore_blank=True, lowercase=True, **kwargs):
-    """使用模糊匹配的奖励函数，用于评估生成的答案与标准答案的相似度。
-    
-    参数:
-        completions: 待评估的生成文本列表
-        answers: 标准答案列表
-        fuzz_method: 模糊匹配方法，选项包括 'ratio', 'partial_ratio', 'token_sort_ratio', 'token_set_ratio'
-        threshold: 匹配阈值，默认为80
-        ignore_blank: 是否忽略空格，默认为True
-        lowercase: 是否忽略大小写，默认为True
-    
-    返回:
-        rewards: 奖励值列表，值范围为0.0到1.0
-    """
     import re
     from fuzzywuzzy import fuzz
     
     rewards = []
     for completion, correct_answer in zip(completions, answers):
         try:
-            # 预处理生成的答案和标准答案
+ 
             pred = str(completion).strip()
             gold = str(correct_answer).strip()
             
-            # 选择模糊匹配方法
             fuzz_function = getattr(fuzz, fuzz_method)
             
-            # 根据参数处理空格
             if ignore_blank:
-                if fuzz_method in ['token_sort_ratio', 'token_set_ratio']:  # 对于基于令牌的方法，保留空格
+                if fuzz_method in ['token_sort_ratio', 'token_set_ratio']:
                     pred, gold = re.sub(r'\s+', ' ', pred), re.sub(r'\s+', ' ', gold)
-                else:  # 对于其他方法，移除所有空格
+                else:
                     pred, gold = re.sub(r'\s+', '', pred), re.sub(r'\s+', '', gold)
             
-            # 计算模糊匹配分数
             if lowercase:
                 match_score = fuzz_function(pred.lower(), gold.lower())
             else:
                 match_score = fuzz_function(pred, gold)
-            
-            # 将分数转换为奖励
-            reward = float(match_score) / 100.0  # 将0-100的分数映射到0-1
-            
-            # 或者使用二值化的奖励方式
-            # reward = float(match_score >= threshold)
-            
+
+            if use_threshold:
+                # 或者使用二值化的奖励方式
+                reward = float(match_score >= threshold)
+            else:
+                # 将分数转换为奖励
+                reward = float(match_score) / 100.0  # 将0-100的分数映射到0-1
+
             rewards.append(reward)
+
         except Exception as e:
-            # 处理错误情况，给予零奖励
             rewards.append(0.0)
     
     return rewards
@@ -111,16 +77,18 @@ def fuzzy_match_reward(completions, answers, fuzz_method='ratio', threshold=80, 
 #args: Namespace = parse_args()
 data: List[Dict[str, Any]] = load_test_data("test_data_553.jsonl", "airqa")
 formatted_data = []
-# TODO: 这里的数据集构造非常冗余
+# TODO: 这里的数据集构造非常冗余，后续细化的时候再处理
 for item in data:
     if "prompt" not in item:
-        prompt = item.get("question") + ' ' + item.get("answer_format")
-        formatted_data.append({"prompt": prompt, "question": item.get("question"), "answer_format": item.get("answer_format"), "answers": item.get("reference_answer")})
+        formatted_data.append({"prompt": item.get("question") + ' ' + item.get("answer_format"), "question": item.get("question"), "answer_format": item.get("answer_format"), 
+                               "answers": item.get("evaluator").get("eval_kwargs").get("reference_answer")})
     else:
         formatted_data.append(item)
 
 
 dataset = Dataset.from_list(formatted_data)
+
+print(dataset[0])
 
 train_test_split = dataset.train_test_split(test_size=0.1)
 train_dataset = train_test_split["train"]
@@ -150,7 +118,9 @@ trainer = GRPOTrainer(
     vectorstore_path=args.vectorstore_path,
     launch_method=args.launch_method,
     docker_uri=args.docker_uri,
-    interact_protocol=args.interact_protocol
+    interact_protocol=args.interact_protocol,
+    db_format=args.db_format,
+    vs_format=args.vs_format
 )
 
 trainer.train()
