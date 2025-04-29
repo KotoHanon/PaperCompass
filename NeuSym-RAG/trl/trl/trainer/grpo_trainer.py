@@ -520,9 +520,9 @@ class GRPOTrainer(Trainer):
             docker_uri=docker_uri
         )
         self.max_turn = max_turn
-        self.agent_method = agent_method
+        #self.agent_method = agent_method
         self.dataset = dataset
-        self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
+        #self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
@@ -559,7 +559,7 @@ class GRPOTrainer(Trainer):
             {'role': 'system', 'content': self.agent_prompt},
             {'role': 'user', 'content': task_prompt}
         ]'''
-        logger.info(f'[Agent Prompt]: {self.agent_prompt}')
+        # logger.info(f'[Agent Prompt]: {self.agent_prompt}')
 
         # Datasets
         self.database = database
@@ -1341,7 +1341,6 @@ class GRPOTrainer(Trainer):
                     prompt_ids = prompt_ids[:, -self.max_prompt_length:]
                     prompt_mask = prompt_mask[:, -self.max_prompt_length:]
                 
-                # 使用GRPO的生成方法
                 with unwrap_model_for_generation(
                     self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
@@ -1353,7 +1352,7 @@ class GRPOTrainer(Trainer):
                 prompt_length = prompt_ids.size(1)
                 completion_ids = prompt_completion_ids[:, prompt_length:]
                 
-                # 处理completion_ids，只保留最后一个EOS标记
+                # 处理completion_ids，只保留最后一个EOS标记（因为是多次回答拼接成完整的traj）
                 for i in range(completion_ids.size(0)):
                     # 找出当前序列中所有EOS标记的位置
                     eos_positions = (completion_ids[i] == self.processing_class.eos_token_id).nonzero(as_tuple=True)[0]
@@ -1405,12 +1404,12 @@ class GRPOTrainer(Trainer):
             messages.append(obs_msg)
 
             if flag: # whether task is completed
-                #cost = self.model.get_cost() - prev_cost
-                #logger.info(f'[Info]: early stop at interaction turn {turn + 1}, cost ${cost:.6f}.')
+                cost = self.model.get_cost() - prev_cost
+                logger.info(f'[Info]: early stop at interaction turn {turn + 1}, cost ${cost:.6f}.')
                 break
         else:
-            #cost = self.model.get_cost() - prev_cost
-            #logger.info(f'[Warning]: exceeds the maximum interaction turn {self.max_turn}, cost ${cost:.6f}.')
+            # cost = self.model.get_cost() - prev_cost
+            # logger.info(f'[Warning]: exceeds the maximum interaction turn {self.max_turn}, cost ${cost:.6f}.')
             pass
         if output_path is not None:
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -1425,7 +1424,7 @@ class GRPOTrainer(Trainer):
             flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
             flattened_completion_ids = torch.tensor([], device=self.accelerator.device)
             
-        return truncate_tokens(str(obs.obs_content)), flattened_prompt_completion_ids, flattened_completion_ids
+        return truncate_tokens(str(obs.obs_content)), flattened_prompt_completion_ids, flattened_completion_ids # 需要注意padding
     
     
     
