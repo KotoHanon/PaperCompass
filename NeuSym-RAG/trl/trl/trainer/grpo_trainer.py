@@ -396,6 +396,7 @@ class GRPOTrainer(Trainer):
         # Models
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
+
         if isinstance(model, str):
             model_id = model
             torch_dtype = model_init_kwargs.get("torch_dtype")
@@ -413,6 +414,7 @@ class GRPOTrainer(Trainer):
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
+
             model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
@@ -454,9 +456,10 @@ class GRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
+        
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -1071,6 +1074,8 @@ class GRPOTrainer(Trainer):
                     {'role': 'system', 'content': self.agent_prompt},
                     {'role': 'user', 'content': task_prompt}
                 ]
+
+
                 completions_text, prompt_completion_ids, completion_ids = self.forward(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
                 # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的”答案“
                 prompt_completion_idss.append(prompt_completion_ids)
@@ -1383,16 +1388,17 @@ class GRPOTrainer(Trainer):
             true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
             true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
 
-            logger.debug(f'[Response]: {response}')
+            logger.info(f'[Response]: {response}')
             action_msg = action.convert_to_message(self.env.action_format, self.env.interact_protocol)
-            logger.info(action_msg['content'])
+            #logger.info(action_msg['content'])
 
             obs: Observation
             obs_msg = obs.convert_to_message()
             if isinstance(obs_msg['content'], list): # array of messages, see doc: https://platform.openai.com/docs/guides/vision#uploading-base64-encoded-images
                 for obs_msg_content_item in obs_msg['content']:
                     if obs_msg_content_item['type'] == 'text':
-                        logger.info(obs_msg_content_item['text'])
+                        #logger.info(obs_msg_content_item['text'])
+                        pass
             else:
                 logger.info(obs_msg['content'])
 

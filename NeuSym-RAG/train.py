@@ -6,6 +6,7 @@ import sys
 import os
 from argparse import Namespace
 import argparse, logging
+import torch
 
 # 添加本地trl模块路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +35,7 @@ args.example = "airqa_example"
 args.db_format = "create_sql"
 args.vs_format = "detailed_json"
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def fuzzy_match_reward(completions, answers, fuzz_method='ratio', threshold=80, ignore_blank=True, lowercase=True, use_threshold=False, **kwargs):
 
@@ -94,7 +96,11 @@ train_test_split = dataset.train_test_split(test_size=0.1)
 train_dataset = train_test_split["train"]
 eval_dataset = train_test_split["test"]
 
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="sdpa"
+    ).to(device)
 
 config = GRPOConfig(
     num_generations=2,
