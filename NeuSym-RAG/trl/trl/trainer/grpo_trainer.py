@@ -524,7 +524,6 @@ class GRPOTrainer(Trainer):
             vectorstore_path=vectorstore_path,
             docker_uri=docker_uri
         )
-        self.max_turn = max_turn
         #self.agent_method = agent_method
         self.dataset = dataset
         #self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
@@ -574,11 +573,6 @@ class GRPOTrainer(Trainer):
         self.vs_format = vs_format
         self.database_prompt = convert_database_schema_to_prompt(self.database, serialize_method=self.db_format)
         self.vectorstore_prompt = convert_vectorstore_schema_to_prompt(self.vectorstore, serialize_method=self.vs_format, add_description=False)
-
-        self.messages = [
-            {'role': 'system', 'content': "Test"},
-            {'role': 'user', 'content': "What is the capital of France?"}
-        ]
         self.shuffle_dataset = args.shuffle_dataset
 
         if (
@@ -1061,6 +1055,9 @@ class GRPOTrainer(Trainer):
             # TODO: 需要修改，因为inputs[0]是字典，而不是example。这里只是占位用于前向debug
             prompt_completion_idss = []
             completion_idss = []
+
+            # 这里做个并行化处理
+            self.messages = []
             for example in inputs:
                 task_prompt, image_messages = formulate_input(self.dataset, example, use_pdf_id=True)
                 task_prompt = "\n".join([
@@ -1070,25 +1067,25 @@ class GRPOTrainer(Trainer):
                 ])
                 if image_messages:
                     task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
-                self.messages = [
+                self.messages.append(
+                    [
                     {'role': 'system', 'content': self.agent_prompt},
                     {'role': 'user', 'content': task_prompt}
                 ]
+                )
 
-
-                completions_text, prompt_completion_ids, completion_ids = self.forward(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
-                # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的”答案“
-                prompt_completion_idss.append(prompt_completion_ids)
-                completion_idss.append(completion_ids)
-            
-            # 对prompt_completion_idss和completion_idss进行padding
+            # 目前已经对interact函数进行优化，使得generate是并行的
+            # TODO: 并行化后处理
+            completions_texts, prompt_completion_ids, completion_ids = self.interact(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
+            # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的"答案"    
+            '''# 对prompt_completion_idss和completion_idss进行padding
             seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in prompt_completion_idss]
             padded_prompt_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = padded_prompt_completion_ids
 
             seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in completion_idss]
             padded_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
-            completion_ids = padded_completion_ids
+            completion_ids = padded_completion_ids'''
         # 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
         # 因此需要找到每个response的eos，并将其作为结束标志。只留下最后的eos以便后续的处理
 
@@ -1156,11 +1153,11 @@ class GRPOTrainer(Trainer):
 
         if is_conversational(inputs[0]):
             completions = []
-            for prompt, completion in zip(prompts, completions_text):
+            for prompt, completion in zip(prompts, completions_texts):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
-            completions = completions_text
+            completions = completions_texts
         
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
@@ -1262,7 +1259,7 @@ class GRPOTrainer(Trainer):
 
         # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompts_text))
-        self._textual_logs["completion"].extend(gather_object(completions_text))
+        self._textual_logs["completion"].extend(gather_object(completions_texts))
         for i, name in enumerate(self.reward_func_names):
             self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
 
@@ -1323,38 +1320,49 @@ class GRPOTrainer(Trainer):
 
         return action_by_params[most_common_param]
     
-    def forward(self, messages: List[Dict[str, Any]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5) -> str:
+    def interact(self, messages: List[List[Dict[str, Any]]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5) -> str:
         # prev_cost = self.model.get_cost()
         self.env.reset()
         true_prompt_completion_ids = []
         true_completion_ids = []
 
+        batch_size = len(messages)
+        active_mask = [True] * batch_size # 用于记录每个样本是否已经完成任务
+        obss = [[] for _ in range(batch_size)] # 理论上是[batch_size, num_turn]
+
         for turn in range(self.max_turn):
-            if len(messages) > (window_size + 1) * 2: # each turn has two messages from assistant and user, respectively
-                current_messages = messages[:2] + messages[-window_size * 2:]
-            else: current_messages = messages
-
+            if not any(active_mask):
+                logger.info(f'[Info]: all samples have completed the task at turn {turn + 1}.')
+                break
+            
             logger.info(f'[Interaction Turn]: {turn + 1}')
+            prompt_texts = [] # 需要批量处理的prompt
+            for message in messages:
+                if len(message) > (window_size + 1) * 2: # each turn has two messages from assistant and user, respectively
+                    current_message = message[:2] + message[-window_size * 2:]
+                else: current_message = message
 
+                message = self.convert_message_from_gpt_format(messages=current_message)
+                prompt_texts.append(maybe_apply_chat_template({"prompt": message}, self.processing_class)["prompt"])
+
+            prompt_inputs = self.processing_class(
+                text=prompt_texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+            )
+            # 此时prompt_inputs是[batch_size, emb_size]
+            prompt_inputs = super()._prepare_inputs(prompt_inputs)
+            prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(self.accelerator.device), prompt_inputs["attention_mask"].to(self.accelerator.device)
+            
+            if self.max_prompt_length is not None:
+                prompt_ids = prompt_ids[:, -self.max_prompt_length:]
+                prompt_mask = prompt_mask[:, -self.max_prompt_length:]
+            
             iter = 1 if use_consistency_selection else consistency_N
-            responses = []
+            responsess = []
             prompt_completion_idss = []
             completion_idss = []
-            for _ in range(iter):
+            '''for _ in range(iter):
                 # 使用GRPO的生成方法替代model.get_response
                 # 参考Agent框架里面的convert_message_from_gpt_format，做出裁剪。
-                messages = self.convert_message_from_gpt_format(messages=current_messages)
-                prompt_text = maybe_apply_chat_template({"prompt": messages}, self.processing_class)["prompt"]
-                prompt_inputs = self.processing_class(
-                    text=[prompt_text], return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-                )
-                prompt_inputs = super()._prepare_inputs(prompt_inputs)
-                prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(self.accelerator.device), prompt_inputs["attention_mask"].to(self.accelerator.device)
-                
-                if self.max_prompt_length is not None:
-                    prompt_ids = prompt_ids[:, -self.max_prompt_length:]
-                    prompt_mask = prompt_mask[:, -self.max_prompt_length:]
-                
                 with unwrap_model_for_generation(
                     self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
@@ -1367,94 +1375,158 @@ class GRPOTrainer(Trainer):
                 completion_ids = prompt_completion_ids[:, prompt_length:]
                 
                 completion_idss.append(completion_ids)
-                completion_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
+                completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
                 
-                response = completion_text
-                
-                obs, _, flag, _ = self.env.step(response, **output_kwargs)
-                responses.append(response)
+                # 因为step是串行交互的，因此这里通过for循环转串行
+                responses = completion_texts
+                for response in responses:
+                    obs, _, flag, _ = self.env.step(response, **output_kwargs)
+                    obss.append(obs)
+                    flags.append(flag)'''
+
+            with unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model:
+                    prompt_completion_ids = unwrapped_model.generate(
+                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                    )
+                    '''prompt_completion_idss.append(prompt_completion_ids)'''
+
+            prompt_length = prompt_ids.size(1)
+            completion_ids = prompt_completion_ids[:, prompt_length:]
             
-            candidate_actions : List[Dict[int, Action]] = [{
+            '''completion_idss.append(completion_ids)'''
+            completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            
+            # 因为step是串行交互的，因此这里通过for循环转串行
+            for idx in range(batch_size):
+                if active_mask[idx]:
+                    response = completion_texts[idx]
+                    obs, _, flag, _ = self.env.step(response, **output_kwargs)
+                    obss[idx].append(obs) # [batch_size, num_turn]
+                    if flag:
+                        active_mask[idx] = False # 对应的样本已经完成任务
+                else:
+                    obss[idx].append(None)
+                    # 把completion_ids[idx]中的每一个元素替换为pad_token_id。因为对已经交互结束的样本，我们不应该继续计算它的loss。
+                    completion_ids[idx] = torch.full_like(completion_ids[idx], self.processing_class.pad_token_id)
+                    prompt_completion_ids[idx][:, prompt_length:] = completion_ids[idx]
+
+            '''responsess.append(responses)'''
+            '''candidate_actions : List[Dict[int, Action]] = [{
                 "idx": i,
                 "action": self.env.parsed_actions[-i:]
-            } for i in range(iter)]
+            } for i in range(iter)]'''
             # clean the last iter_num actions, and only keep the most consistent action
             # TODO: 需要解决self.get_most_consistent_action(candidate_actions)[0]返回的是一个元组，而不是一个Action的问题
-            action: Action = self.get_most_consistent_action(candidate_actions)[0][0]
-            self.env.parsed_actions = self.env.parsed_actions[:-iter]
-            self.env.parsed_actions.append(action)
+            actions: List[Action] = self.env.parsed_actions[-batch_size:] # 一共有batch_size个action，按response的顺序依次添加
+            '''self.env.parsed_actions = self.env.parsed_actions[:-iter]
+            self.env.parsed_actions.append(action)'''
             # get the response of the most consistent action by index
-            response = responses[self.get_most_consistent_action(candidate_actions)[1]]
+            '''responses = responsess[self.get_most_consistent_action(candidate_actions)[1]]
             true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
-            true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
+            true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])'''
+    
+            true_prompt_completion_ids.append(prompt_completion_ids) # true_prompt_completion_ids是num_turn个[batch_size, seq_len]的张量
+            true_completion_ids.append(completion_ids) # true_completion_ids是num_turn个[batch_size, seq_len]的张量
 
-            logger.info(f'[Response]: {response}')
-            action_msg = action.convert_to_message(self.env.action_format, self.env.interact_protocol)
-            #logger.info(action_msg['content'])
 
-            obs: Observation
-            obs_msg = obs.convert_to_message()
-            if isinstance(obs_msg['content'], list): # array of messages, see doc: https://platform.openai.com/docs/guides/vision#uploading-base64-encoded-images
+            logger.info(f'[Response]: {completion_texts[0]}')
+
+            action_msgs = []
+            obs_msgs = []
+            
+            # 把action和obs转换成message
+            for action in actions:
+                if action is None:
+                    action_msgs.append(None)
+                else:
+                    action_msgs.append(action.convert_to_message(self.env.action_format, self.env.interact_protocol))
+            
+            for idx in range(batch_size):
+                if obss[idx][-1] is not None: # 若obss[idx][-1]为None，则说明样本在第turn轮已经完成任务
+                    obs_msgs.append(obss[idx][-1].convert_to_message())
+                else:
+                    obs_msgs.append(None) # 相当于padding
+        
+                #logger.info(action_msg['content'])
+
+            '''if isinstance(obs_msg['content'], list): # array of messages, see doc: https://platform.openai.com/docs/guides/vision#uploading-base64-encoded-images
                 for obs_msg_content_item in obs_msg['content']:
                     if obs_msg_content_item['type'] == 'text':
                         #logger.info(obs_msg_content_item['text'])
                         pass
             else:
-                logger.info(obs_msg['content'])
+                logger.info(obs_msg['content'])'''
 
             # update history messages
-            messages.append(action_msg)
-            messages.append(obs_msg)
+            
+            print(len(messages))
+            print(len(action_msgs))
 
+            # 分发给batch中的每个Q
+            for idx, (action_msg, obs_msg) in enumerate(zip(action_msgs, obs_msgs)):
+                messages[idx].append(action_msg)
+                messages[idx].append(obs_msg)
             if flag: # whether task is completed
-                cost = self.model.get_cost() - prev_cost
-                logger.info(f'[Info]: early stop at interaction turn {turn + 1}, cost ${cost:.6f}.')
+                logger.info(f'[Info]: early stop at interaction turn {turn + 1}.')
                 break
-        else:
-            # cost = self.model.get_cost() - prev_cost
-            # logger.info(f'[Warning]: exceeds the maximum interaction turn {self.max_turn}, cost ${cost:.6f}.')
-            pass
+        
         if output_path is not None:
             with open(output_path, 'w', encoding='utf-8') as f:
                 for m in messages:
                     f.write(json.dumps(m, ensure_ascii=False) + '\n')
-        if true_prompt_completion_ids:
-            # 如果列表非空，将所有张量拼接为一个大张量
-            flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=1)
-            flattened_completion_ids = torch.cat(true_completion_ids, dim=1)
+
+        # 对obss进行处理，把最后的非None值保留作为这个response的prev_answer.
+        real_obss = [] # [batch_size, 1]
+        for idx_1 in range(batch_size):
+            for idx_2 in reversed(range(len(obss[idx_1]))):
+                if obss[idx_1][idx_2] is not None:
+                    real_obss.append(obss[idx_1][idx_2])
+                    break
+        
+        if true_prompt_completion_ids is not None:
+            # 如果列表非空，将所有张量拼接为一个[batch_size, turn_num * seq_len]的张量
+            first_dim_flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=1)
+            first_dim_flattened_completion_ids = torch.cat(true_completion_ids, dim=1)
         else:
             # 如果列表为空，创建空张量
-            flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
-            flattened_completion_ids = torch.tensor([], device=self.accelerator.device)
+            first_dim_flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
+            first_dim_flattened_completion_ids = torch.tensor([], device=self.accelerator.device)
             
         # 处理flattened张量中的EOS标记，只保留最后一个
         def replace_all_but_last_eos(tensor, eos_token_id, pad_token_id):
             """只保留张量中最后一个EOS标记，其他EOS标记替换为PAD标记"""
-            if tensor.dim() == 2 and tensor.size(0) == 1:  # 确保是[1, seq_len]形状
-                # 找出所有EOS标记的位置
-                eos_positions = (tensor[0] == eos_token_id).nonzero(as_tuple=True)[0]
-                if len(eos_positions) > 1:  # 如果有多个EOS标记
-                    # 仅保留最后一个EOS标记，其他的替换为PAD标记
-                    for pos in eos_positions[:-1]:
-                        tensor[0, pos] = pad_token_id
+            if tensor.dim() == 2 and tensor.size(0) == batch_size:  # 确保是[batch_size, seq_len]形状
+                # 对批次中的每个样本进行处理
+                for batch_idx in range(batch_size):
+                    # 找出当前样本中所有EOS标记的位置
+                    eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
+                    if len(eos_positions) > 1:  # 如果有多个EOS标记
+                        # 仅保留最后一个EOS标记，其他的替换为PAD标记
+                        for pos in eos_positions[:-1]:
+                            tensor[batch_idx, pos] = pad_token_id
             return tensor
         
         # 应用EOS替换函数
-        if flattened_prompt_completion_ids.numel() > 0:
-            flattened_prompt_completion_ids = replace_all_but_last_eos(
-                flattened_prompt_completion_ids, 
+        if first_dim_flattened_prompt_completion_ids.numel() > 0:
+            first_dim_flattened_prompt_completion_ids = replace_all_but_last_eos(
+                first_dim_flattened_prompt_completion_ids, 
                 self.processing_class.eos_token_id, 
                 self.processing_class.pad_token_id
             )
         
-        if flattened_completion_ids.numel() > 0:
-            flattened_completion_ids = replace_all_but_last_eos(
-                flattened_completion_ids, 
+        if first_dim_flattened_completion_ids.numel() > 0:
+            first_dim_flattened_completion_ids = replace_all_but_last_eos(
+                first_dim_flattened_completion_ids, 
                 self.processing_class.eos_token_id, 
                 self.processing_class.pad_token_id
             )
+
+        print(first_dim_flattened_completion_ids.shape)
+        print(first_dim_flattened_prompt_completion_ids.shape)
             
-        return truncate_tokens(str(obs.obs_content)), flattened_prompt_completion_ids, flattened_completion_ids # 需要注意padding
+        return [truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
 
     def crop_image_count_in_messages(
         self,

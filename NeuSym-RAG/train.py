@@ -30,10 +30,12 @@ args.database_path = os.path.join(current_dir, "data/database/ai_research/ai_res
 args.vectorstore_path = os.path.join(current_dir, "data/vectorstore/ai_research/ai_research.base501.db")
 args.launch_method = "standalone"
 args.docker_uri = None 
-args.max_turn = 5
+args.max_turn = 2
 args.example = "airqa_example"
 args.db_format = "create_sql"
 args.vs_format = "detailed_json"
+args.database_path = os.path.join(current_dir, "data/database/ai_research/ai_research.base501.duckdb")
+args.vectorstore_path = os.path.join(current_dir, "data/vectorstore/ai_research/ai_research.base501.db")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -103,10 +105,11 @@ model = AutoModelForCausalLM.from_pretrained(
     ).to(device)
 
 config = GRPOConfig(
-    num_generations=2,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=2,
+    num_generations=8,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
     wandb_log_unique_prompts=True,
+    max_completion_length=2048
 )
 
 trainer = GRPOTrainer(
