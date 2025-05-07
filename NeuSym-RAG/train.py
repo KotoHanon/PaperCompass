@@ -7,6 +7,8 @@ import os
 from argparse import Namespace
 import argparse, logging
 import torch
+import json
+from utils.data_loading import load_data
 
 # 添加本地trl模块路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +19,7 @@ sys.path.append(trl_path)
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.grpo_config import GRPOConfig
 from transformers import AutoModelForCausalLM
+from evaluation.evaluator import evaluate_airqa
 
 # 创建参数对象并填充默认值，不需要从命令行解析
 args = Namespace()
@@ -39,64 +42,17 @@ args.vectorstore_path = os.path.join(current_dir, "data/vectorstore/ai_research/
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def fuzzy_match_reward(completions, answers, fuzz_method='ratio', threshold=80, ignore_blank=True, lowercase=True, use_threshold=False, **kwargs):
+train_dataset, eval_dataset = load_data()
 
-    import re
-    from fuzzywuzzy import fuzz
-    
+def reward_func_adapter(prompts, completions, **reward_kwargs): # 适配层，将evaluate_airqa函数适配为reward_func（reward router）
     rewards = []
-    for completion, correct_answer in zip(completions, answers):
-        try:
- 
-            pred = str(completion).strip()
-            gold = str(correct_answer).strip()
-            
-            fuzz_function = getattr(fuzz, fuzz_method)
-            
-            if ignore_blank:
-                if fuzz_method in ['token_sort_ratio', 'token_set_ratio']:
-                    pred, gold = re.sub(r'\s+', ' ', pred), re.sub(r'\s+', ' ', gold)
-                else:
-                    pred, gold = re.sub(r'\s+', '', pred), re.sub(r'\s+', '', gold)
-            
-            if lowercase:
-                match_score = fuzz_function(pred.lower(), gold.lower())
-            else:
-                match_score = fuzz_function(pred, gold)
-
-            if use_threshold:
-                # 或者使用二值化的奖励方式
-                reward = float(match_score >= threshold)
-            else:
-                # 将分数转换为奖励
-                reward = float(match_score) / 100.0  # 将0-100的分数映射到0-1
-
-            rewards.append(reward)
-
-        except Exception as e:
-            rewards.append(0.0)
+    for i, completion in enumerate(completions):
+        gold_str = reward_kwargs["gold_str"][i]
+        gold_answer = json.loads(gold_str)
+        score = evaluate_airqa(pred_answer=completion, gold=gold_answer)
+        rewards.append(float(score))
     
     return rewards
-
-#args: Namespace = parse_args()
-data: List[Dict[str, Any]] = load_test_data("test_data_553.jsonl", "airqa")
-formatted_data = []
-# TODO: 这里的数据集构造非常冗余，后续细化的时候再处理
-for item in data:
-    if "prompt" not in item:
-        formatted_data.append({"prompt": item.get("question") + ' ' + item.get("answer_format"), "question": item.get("question"), "answer_format": item.get("answer_format"), 
-                               "answers": item.get("evaluator").get("eval_kwargs").get("reference_answer")})
-    else:
-        formatted_data.append(item)
-
-
-dataset = Dataset.from_list(formatted_data)
-
-print(dataset[0])
-
-train_test_split = dataset.train_test_split(test_size=0.1)
-train_dataset = train_test_split["train"]
-eval_dataset = train_test_split["test"]
 
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -115,7 +71,7 @@ config = GRPOConfig(
 trainer = GRPOTrainer(
     model=model,
     args=config,
-    reward_funcs=fuzzy_match_reward,
+    reward_funcs=reward_func_adapter,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     agent_method=args.agent_method,

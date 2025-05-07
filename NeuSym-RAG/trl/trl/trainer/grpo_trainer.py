@@ -1460,9 +1460,6 @@ class GRPOTrainer(Trainer):
                 logger.info(obs_msg['content'])'''
 
             # update history messages
-            
-            print(len(messages))
-            print(len(action_msgs))
 
             # 分发给batch中的每个Q
             for idx, (action_msg, obs_msg) in enumerate(zip(action_msgs, obs_msgs)):
