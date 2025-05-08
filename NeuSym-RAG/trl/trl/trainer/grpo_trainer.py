@@ -72,6 +72,7 @@ from agents.envs.actions import Action, Observation
 from utils.functions.common_functions import truncate_tokens
 from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
+from .training_adapter import TrainingAdapter
 import logging, json, tiktoken
 
 
@@ -638,6 +639,15 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+        self.model = model
+        self.args = args
+        self.data_collator = data_collator
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.processing_class = processing_class
+        self.callbacks = callbacks
+        self.optimizers = optimizers
+
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
@@ -1057,7 +1067,7 @@ class GRPOTrainer(Trainer):
             completion_idss = []
 
             # 这里做个并行化处理
-            self.messages = []
+            ''' self.messages = []
             for example in inputs:
                 task_prompt, image_messages = formulate_input(self.dataset, example, use_pdf_id=True)
                 task_prompt = "\n".join([
@@ -1072,11 +1082,11 @@ class GRPOTrainer(Trainer):
                     {'role': 'system', 'content': self.agent_prompt},
                     {'role': 'user', 'content': task_prompt}
                 ]
-                )
+                )'''
 
             # 目前已经对interact函数进行优化，使得generate是并行的
             # TODO: 并行化后处理
-            completions_texts, prompt_completion_ids, completion_ids = self.interact(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response
+            ''' completions_texts, prompt_completion_ids, completion_ids = self.interact(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response'''
             # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的"答案"    
             '''# 对prompt_completion_idss和completion_idss进行padding
             seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in prompt_completion_idss]
@@ -1086,7 +1096,7 @@ class GRPOTrainer(Trainer):
             seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in completion_idss]
             padded_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
             completion_ids = padded_completion_ids'''
-        # 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
+        '''# 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
         # 因此需要找到每个response的eos，并将其作为结束标志。只留下最后的eos以便后续的处理
 
         # mask掉两个内容：1. 第一个eos之后的token； 2. 是pad的token
@@ -1124,7 +1134,10 @@ class GRPOTrainer(Trainer):
                 attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]
 
         # 拼接 attention_mask
-        attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)
+        attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)'''
+        
+        training_adapter = TrainingAdapter(self.model, self.args, self.data_collator, self.train_dataset, self.eval_dataset, self.processing_class, self.callbacks, self.optimizers)
+        completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos = training_adapter.adaption_layer(self, inputs, prompt_ids, prompt_mask, use_consistency_selection=False, consistency_N=1, logger=logger)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size

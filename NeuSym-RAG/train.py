@@ -61,9 +61,9 @@ model = AutoModelForCausalLM.from_pretrained(
     ).to(device)
 
 config = GRPOConfig(
-    num_generations=8,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    num_generations=2,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=1,
     wandb_log_unique_prompts=True,
     max_completion_length=2048
 )

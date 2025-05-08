@@ -27,3 +27,5 @@ openreview-py==1.45.0
 beautifulsoup4==4.12.3
 nltk==3.9.1
 graphrag==1.2.0
+datasets
+accelerate
