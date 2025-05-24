@@ -25,6 +25,7 @@ import datasets
 import torch
 import torch.utils.data
 import transformers
+from accelerate import Accelerator
 from torch.nn.utils.rnn import pad_sequence
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
@@ -72,8 +73,10 @@ from agents.envs.actions import Action, Observation
 from utils.functions.common_functions import truncate_tokens
 from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
-from .training_adapter import TrainingAdapter
+from .training_adapter import adaption_layer
 import logging, json, tiktoken
+
+API_KEY = "be190084a05f7ea4c7eb9ea8fab419b7ad717110"
 
 
 if is_peft_available():
@@ -84,6 +87,7 @@ if is_liger_kernel_available():
 
 if is_wandb_available():
     import wandb
+    wandb.login(key=API_KEY)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -386,7 +390,7 @@ class GRPOTrainer(Trainer):
         image_limit: int = 10,
         length_limit: int = 32,
         database_path: str = None,
-        vectorstore_path: str = None,
+        vectorstore_dir: str = None,
     ):
         # Args
         if args is None:
@@ -512,19 +516,8 @@ class GRPOTrainer(Trainer):
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
             return features
-        
         # LLM, env, agent
-        self.env: AgentEnv = infer_env_class('neusym_rag')(
-            dataset=dataset,
-            action_format=action_format,
-            interact_protocol=interact_protocol,
-            database=database,
-            vectorstore=vectorstore,
-            database_path=database_path,
-            launch_method=launch_method,
-            vectorstore_path=vectorstore_path,
-            docker_uri=docker_uri
-        )
+        self.vectorstore_dir = vectorstore_dir
         #self.agent_method = agent_method
         self.dataset = dataset
         #self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
@@ -547,12 +540,6 @@ class GRPOTrainer(Trainer):
         self.consistency_N = 3
         self.max_turn = max_turn
         self.image_limit, self.length_limit = image_limit, length_limit
-        self.agent_prompt = AGENT_PROMPTS[agent_method].format(
-            system_prompt=SYSTEM_PROMPTS[agent_method],
-            action_space_prompt=self.env.action_space_prompt,
-            hint_prompt=HINT_PROMPTS[agent_method],
-            max_turn=max_turn
-        )
         '''task_prompt, image_messages = formulate_input(dataset, example, use_pdf_id=True)
         task_prompt = "\n".join([
             task_prompt,
@@ -658,6 +645,24 @@ class GRPOTrainer(Trainer):
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
         maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.gradient_accumulation_steps
+
+        self.env: AgentEnv = infer_env_class('neusym_rag')(
+            dataset=dataset,
+            action_format=action_format,
+            interact_protocol=interact_protocol,
+            database=database,
+            vectorstore=vectorstore,
+            database_path=database_path,
+            launch_method=launch_method,
+            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".db"),
+            docker_uri=docker_uri
+        )
+        self.agent_prompt = AGENT_PROMPTS[agent_method].format(
+            system_prompt=SYSTEM_PROMPTS[agent_method],
+            action_space_prompt=self.env.action_space_prompt,
+            hint_prompt=HINT_PROMPTS[agent_method],
+            max_turn=max_turn
+        )
         self._textual_logs = {
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
@@ -1136,8 +1141,7 @@ class GRPOTrainer(Trainer):
         # 拼接 attention_mask
         attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)'''
         
-        training_adapter = TrainingAdapter(self.model, self.args, self.data_collator, self.train_dataset, self.eval_dataset, self.processing_class, self.callbacks, self.optimizers)
-        completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos = training_adapter.adaption_layer(self, inputs, prompt_ids, prompt_mask, use_consistency_selection=False, consistency_N=1, logger=logger)
+        completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos = adaption_layer(self, inputs, prompt_ids, prompt_mask, use_consistency_selection=False, consistency_N=1, logger=logger, prepare_input_function=super()._prepare_inputs)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
@@ -1219,6 +1223,9 @@ class GRPOTrainer(Trainer):
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        if self.accelerator.is_main_process:
+            self.accelerator.log({"rewards": torch.mean(rewards)})
+            logger.info(f"rewards:{torch.mean(rewards)}")
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1533,8 +1540,9 @@ class GRPOTrainer(Trainer):
                 self.processing_class.pad_token_id
             )
 
-        print(first_dim_flattened_completion_ids.shape)
-        print(first_dim_flattened_prompt_completion_ids.shape)
+        if self.accelerator.is_main_process:
+            print(first_dim_flattened_completion_ids.shape)
+            print(first_dim_flattened_prompt_completion_ids.shape)
             
         return [truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
 

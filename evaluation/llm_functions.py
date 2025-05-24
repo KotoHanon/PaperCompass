@@ -5,6 +5,70 @@ import fuzzywuzzy.fuzz as fuzz
 from typing import Any, Dict, List, Tuple, Optional, Union
 from openai.types.chat.chat_completion import ChatCompletion
 
+def load_local_model_and_tokenizer(model_name_or_path: str):
+    """
+    加载本地的Hugging Face模型和分词器。
+    使用全局变量缓存，避免重复加载。
+    """
+    global _local_model, _local_tokenizer, _loaded_model_name_or_path
+
+    if _loaded_model_name_or_path == model_name_or_path and _local_model is not None and _local_tokenizer is not None:
+        print(f"Using cached model: {model_name_or_path}")
+        return _local_model, _local_tokenizer
+
+    print(f"Loading model: {model_name_or_path}. This may take a while...")
+    try:
+        # 某些模型（如Qwen）需要信任远程代码
+        _local_tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True
+        )
+        _local_model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype="auto",  # 自动选择合适的dtype，例如 bfloat16
+            device_map="auto",   # 自动将模型分配到可用的GPU或CPU
+            trust_remote_code=True
+        )
+        _loaded_model_name_or_path = model_name_or_path
+        print(f"Model {model_name_or_path} loaded successfully on device: {_local_model.device}")
+    except Exception as e:
+        print(f"Error loading local model {model_name_or_path}: {e}")
+        # 如果出错，清空全局变量，以便下次尝试重新加载
+        _local_model = None
+        _local_tokenizer = None
+        _loaded_model_name_or_path = None
+        raise
+    return _local_tokenizer, _local_model
+
+def call_local_llm_with_message(
+    messages: Any,
+    model_name_or_path: str,
+    top_p: float= 0.95,
+    temperature: float = 0.7,
+    max_new_tokens=100
+):
+    tokenizer, model = load_local_model_and_tokenizer(model_name_or_path)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+        )
+    response_tokens = outputs[0][inputs['input_ids'].shape[-1]:]
+    response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+    return response.strip()
+
 try:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
     from utils.functions.common_functions import call_llm_with_message
@@ -29,7 +93,7 @@ except:
         return completion.choices[0].message.content.strip()
 
 
-DEFAULT_LLM_MODEL = 'gpt-4o-mini'
+DEFAULT_LLM_MODEL = 'Qwen/Qwen2.5-32B-Instruct'
 DEFAULT_TEMPERATURE = 0.0
 
 
@@ -41,7 +105,7 @@ def _eval_with_llm(template, llm_model, temperature, target: str = 'true') -> fl
         {"role": "system", "content": system_msg},
         {"role": "user", "content": user_msg}
     ]
-    llm_output = call_llm_with_message(messages, llm_model, temperature=temperature)
+    llm_output = call_local_llm_with_message(messages, llm_model, temperature=temperature)
     # Extract the final judgement
     matched = re.findall(r'```(txt)?\s(.*?)\s```', llm_output, re.DOTALL)
     if len(matched) == 0:

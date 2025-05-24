@@ -18,10 +18,19 @@ sys.path.append(trl_path)
 
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.grpo_config import GRPOConfig
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM # AutoConfig 也可能有用
 from evaluation.evaluator import evaluate_airqa
 
-# 创建参数对象并填充默认值，不需要从命令行解析
+tiktoken_cache_dir = "."
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+cache_key = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
+# validate
+assert os.path.exists(os.path.join(tiktoken_cache_dir, cache_key))
+
+os.environ["OPENAI_API_KEY"] = "sk-KEtnsUqhD7gxzeP3D7FcCf90C83a478c8a8f9b171aE72302"
+os.environ["OPENAI_BASE_URL"] = "https://api.xi-ai.cn/v1"
+
+# 创建参数对象并填充默认值
 args = Namespace()
 args.dataset = "airqa"
 args.agent_method = "neusym_rag"
@@ -30,42 +39,40 @@ args.interact_protocol = "react"
 args.database = "ai_research"
 args.vectorstore = "ai_research"
 args.database_path = os.path.join(current_dir, "data/database/ai_research/ai_research.base501.duckdb")
-args.vectorstore_path = os.path.join(current_dir, "data/vectorstore/ai_research/ai_research.base501.db")
+args.vectorstore_dir = os.path.join(current_dir, "data/vectorstore/ai_research/")
 args.launch_method = "standalone"
-args.docker_uri = None 
-args.max_turn = 2
+args.docker_uri = None
+args.max_turn = 10
 args.example = "airqa_example"
 args.db_format = "create_sql"
 args.vs_format = "detailed_json"
-args.database_path = os.path.join(current_dir, "data/database/ai_research/ai_research.base501.duckdb")
-args.vectorstore_path = os.path.join(current_dir, "data/vectorstore/ai_research/ai_research.base501.db")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 train_dataset, eval_dataset = load_data()
 
-def reward_func_adapter(prompts, completions, **reward_kwargs): # 适配层，将evaluate_airqa函数适配为reward_func（reward router）
+def reward_func_adapter(prompts, completions, **reward_kwargs):
     rewards = []
     for i, completion in enumerate(completions):
         gold_str = reward_kwargs["gold_str"][i]
         gold_answer = json.loads(gold_str)
         score = evaluate_airqa(pred_answer=completion, gold=gold_answer)
         rewards.append(float(score))
-    
     return rewards
 
+
 model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-0.5B-Instruct",
+    pretrained_model_name_or_path="./.cache/Qwen2.5-3B-OurInstruct",
     torch_dtype=torch.bfloat16,
     attn_implementation="sdpa"
-    ).to(device)
+)
 
 config = GRPOConfig(
-    num_generations=2,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=1,
+    num_generations=8,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
     wandb_log_unique_prompts=True,
-    max_completion_length=2048
+    max_completion_length=1024,
+    bf16=True,
+    max_steps=500,
 )
 
 trainer = GRPOTrainer(
@@ -80,12 +87,12 @@ trainer = GRPOTrainer(
     database=args.database,
     vectorstore=args.vectorstore,
     database_path=args.database_path,
-    vectorstore_path=args.vectorstore_path,
+    vectorstore_dir=args.vectorstore_dir,
     launch_method=args.launch_method,
     docker_uri=args.docker_uri,
     interact_protocol=args.interact_protocol,
     db_format=args.db_format,
-    vs_format=args.vs_format
+    vs_format=args.vs_format,
 )
 
 trainer.train()
