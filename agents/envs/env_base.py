@@ -56,6 +56,7 @@ class AgentEnv(gym.Env):
         """
         parse_error = False
         if isinstance(action, str):
+            from .actions import ErrorAction
             flag, action = Action.parse_action(
                 action,
                 action_types=self.__class__.action_space,
@@ -63,6 +64,7 @@ class AgentEnv(gym.Env):
                 interact_protocol=self.interact_protocol
             )
             if not flag: parse_error = True
+
         self.parsed_actions.append(action)
 
         # execute the action, the first parameter is the AgentEnv class itself

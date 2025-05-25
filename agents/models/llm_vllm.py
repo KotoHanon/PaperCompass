@@ -4,7 +4,8 @@ from typing import List, Dict, Tuple, Any, Optional
 from openai.types.chat.chat_completion import ChatCompletion
 from openai import OpenAI
 from agents.models.llm_base import LLMClient
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 try:
     from utils.config import CACHE_DIR
@@ -78,7 +79,8 @@ class VLLMClient(LLMClient):
         'qvq-72b-preview': os.path.join(CACHE_DIR, 'QVQ-72B-Preview'),
         'qwq-32b-preview': os.path.join(CACHE_DIR, 'QWQ-32B-Preview'),
         'llama-3.2-90b-vision-instruct': os.path.join(CACHE_DIR, 'Llama-3.2-90B-Vision-Instruct'),
-        'llama-3.3-70b-instruct': os.path.join(CACHE_DIR, 'Llama-3.3-70B-Instruct')
+        'llama-3.3-70b-instruct': os.path.join(CACHE_DIR, 'Llama-3.3-70B-Instruct'),
+        'qwen2.5-3b-ourinstruct': os.path.join("./.cache", 'Qwen2.5-3B-OurInstruct'),
     }
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, image_limit: int = 10, length_limit: int = 32, **kwargs) -> None:
@@ -156,3 +158,13 @@ class VLLMClient(LLMClient):
         response = completion.choices[0].message.content.strip()
         self.update_usage(completion)
         return response
+        '''llm = AutoModelForCausalLM.from_pretrained(self.model_path[model])
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path[model])
+        prompts = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompts, return_tensors='pt')
+        with torch.no_grad():
+            outputs = llm.generate(**inputs, max_new_tokens=max_tokens, temperature=temperature, top_p=top_p)
+
+        response = outputs[0][inputs['input_ids'].shape[-1]:]
+        #self.update_usage(outputs)
+        return response'''

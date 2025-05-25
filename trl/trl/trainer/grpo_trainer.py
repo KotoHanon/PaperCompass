@@ -383,13 +383,13 @@ class GRPOTrainer(Trainer):
         vectorstore: str = 'airqa',
         launch_method: str = 'standalone',
         docker_uri: str = None,
-        action_format: str = 'json',
+        action_format: str = 'markdown',
         interact_protocol: str = 'react',
         vs_format: str = 'detailed_json',
         db_format: str = 'create_sql',
         image_limit: int = 10,
         length_limit: int = 32,
-        database_path: str = None,
+        database_dir: str = None,
         vectorstore_dir: str = None,
     ):
         # Args
@@ -518,6 +518,7 @@ class GRPOTrainer(Trainer):
             return features
         # LLM, env, agent
         self.vectorstore_dir = vectorstore_dir
+        self.database_dir = database_dir
         #self.agent_method = agent_method
         self.dataset = dataset
         #self.agent: AgentBase = infer_agent_class(self.agent_method)(model, self.env, agent_method=self.agent_method, max_turn=self.max_turn)
@@ -652,7 +653,7 @@ class GRPOTrainer(Trainer):
             interact_protocol=interact_protocol,
             database=database,
             vectorstore=vectorstore,
-            database_path=database_path,
+            database_path=os.path.join(self.database_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".duckdb"),
             launch_method=launch_method,
             vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".db"),
             docker_uri=docker_uri

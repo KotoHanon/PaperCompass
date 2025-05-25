@@ -4,36 +4,27 @@ import re, json, os, sys
 import fuzzywuzzy.fuzz as fuzz
 from typing import Any, Dict, List, Tuple, Optional, Union
 from openai.types.chat.chat_completion import ChatCompletion
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 def load_local_model_and_tokenizer(model_name_or_path: str):
-    """
-    加载本地的Hugging Face模型和分词器。
-    使用全局变量缓存，避免重复加载。
-    """
-    global _local_model, _local_tokenizer, _loaded_model_name_or_path
-
-    if _loaded_model_name_or_path == model_name_or_path and _local_model is not None and _local_tokenizer is not None:
-        print(f"Using cached model: {model_name_or_path}")
-        return _local_model, _local_tokenizer
 
     print(f"Loading model: {model_name_or_path}. This may take a while...")
     try:
-        # 某些模型（如Qwen）需要信任远程代码
         _local_tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path,
             trust_remote_code=True
         )
         _local_model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            torch_dtype="auto",  # 自动选择合适的dtype，例如 bfloat16
-            device_map="auto",   # 自动将模型分配到可用的GPU或CPU
+            torch_dtype="auto",
             trust_remote_code=True
         )
         _loaded_model_name_or_path = model_name_or_path
         print(f"Model {model_name_or_path} loaded successfully on device: {_local_model.device}")
     except Exception as e:
         print(f"Error loading local model {model_name_or_path}: {e}")
-        # 如果出错，清空全局变量，以便下次尝试重新加载
+
         _local_model = None
         _local_tokenizer = None
         _loaded_model_name_or_path = None
@@ -59,7 +50,7 @@ def call_local_llm_with_message(
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=512,
+            max_new_tokens=128,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
@@ -93,7 +84,7 @@ except:
         return completion.choices[0].message.content.strip()
 
 
-DEFAULT_LLM_MODEL = 'Qwen/Qwen2.5-32B-Instruct'
+DEFAULT_LLM_MODEL = '.cache/Qwen3-0.6B'
 DEFAULT_TEMPERATURE = 0.0
 
 

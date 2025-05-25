@@ -2,7 +2,7 @@
 import os, json
 from agents.envs.neural_env import NeuralRAGEnv
 from typing import Optional, List, Tuple, Dict, Union, Any, Type
-from agents.envs.actions import Action, RetrieveFromDatabase, RetrieveFromVectorstore, CalculateExpr, ViewImage, GenerateAnswer
+from agents.envs.actions import Action, RetrieveFromDatabase, RetrieveFromVectorstore, CalculateExpr, ViewImage, GenerateAnswer, ClassicRetrieve
 
 
 class HybridRAGEnv(NeuralRAGEnv):
@@ -11,7 +11,7 @@ class HybridRAGEnv(NeuralRAGEnv):
 
     action_space: List[Type] = [
         RetrieveFromDatabase,
-        RetrieveFromVectorstore,
+        ClassicRetrieve,
         CalculateExpr,
         ViewImage,
         GenerateAnswer

@@ -27,18 +27,15 @@ cache_key = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
 # validate
 assert os.path.exists(os.path.join(tiktoken_cache_dir, cache_key))
 
-os.environ["OPENAI_API_KEY"] = "sk-KEtnsUqhD7gxzeP3D7FcCf90C83a478c8a8f9b171aE72302"
-os.environ["OPENAI_BASE_URL"] = "https://api.xi-ai.cn/v1"
-
 # 创建参数对象并填充默认值
 args = Namespace()
 args.dataset = "airqa"
 args.agent_method = "neusym_rag"
-args.action_format = "json"
+args.action_format = "markdown"
 args.interact_protocol = "react"
 args.database = "ai_research"
 args.vectorstore = "ai_research"
-args.database_path = os.path.join(current_dir, "data/database/ai_research/ai_research.base501.duckdb")
+args.database_dir = os.path.join(current_dir, "data/database/ai_research/")
 args.vectorstore_dir = os.path.join(current_dir, "data/vectorstore/ai_research/")
 args.launch_method = "standalone"
 args.docker_uri = None
@@ -58,21 +55,22 @@ def reward_func_adapter(prompts, completions, **reward_kwargs):
         rewards.append(float(score))
     return rewards
 
+model_list = ["./.cache/Qwen2.5-3B-OurInstruct", "./.cache/Qwen2.5-7B-OurInstruct", "./.cache/Qwen3-0.6B"]
 
 model = AutoModelForCausalLM.from_pretrained(
-    pretrained_model_name_or_path="./.cache/Qwen2.5-3B-OurInstruct",
+    pretrained_model_name_or_path=model_list[0],
     torch_dtype=torch.bfloat16,
-    attn_implementation="sdpa"
+    attn_implementation="sdpa",
 )
 
 config = GRPOConfig(
     num_generations=8,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
+    gradient_accumulation_steps=4,
     wandb_log_unique_prompts=True,
     max_completion_length=1024,
     bf16=True,
-    max_steps=500,
+    max_steps=100,
 )
 
 trainer = GRPOTrainer(
@@ -86,13 +84,14 @@ trainer = GRPOTrainer(
     dataset=args.dataset,
     database=args.database,
     vectorstore=args.vectorstore,
-    database_path=args.database_path,
+    database_dir=args.database_dir,
     vectorstore_dir=args.vectorstore_dir,
     launch_method=args.launch_method,
     docker_uri=args.docker_uri,
     interact_protocol=args.interact_protocol,
     db_format=args.db_format,
     vs_format=args.vs_format,
+    action_format=args.action_format,
 )
 
 trainer.train()

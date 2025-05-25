@@ -36,7 +36,7 @@ def load_data(data_path: str = "test_data_553.jsonl", dataset_name: str = "airqa
 
     dataset = Dataset.from_list(raw_data)
 
-    train_test_split = dataset.train_test_split(test_size=0.1)
+    train_test_split = dataset.train_test_split(test_size=0.1, seed=114514)
     train_dataset = train_test_split["train"]
     eval_dataset = train_test_split["test"]
 

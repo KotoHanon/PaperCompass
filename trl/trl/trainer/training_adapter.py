@@ -48,6 +48,8 @@ from .utils import (
     selective_log_softmax,
 )
 
+from agents.envs.actions import ErrorAction
+
 from agents.envs import infer_env_class, AgentEnv
 from agents.models import infer_model_class, LLMClient
 from agents.frameworks import infer_agent_class, AgentBase
@@ -64,7 +66,6 @@ def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 
     trainer.messages = []
     for example in inputs:
         task_prompt, image_messages = formulate_input(trainer.dataset, example, use_pdf_id=True)
-
 
         task_prompt = "\n".join([
             task_prompt,
@@ -131,28 +132,39 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     trainer.env.reset()
     true_prompt_completion_ids = []
     true_completion_ids = []
+    default_judge_list = []
 
     batch_size = len(messages)
+
+    if trainer.accelerator.is_main_process:
+        logger.info(f'[Batch Size]: {batch_size}')
+
     active_mask = [True] * batch_size # 用于记录每个样本是否已经完成任务
     obss = [[] for _ in range(batch_size)] # 理论上是[batch_size, num_turn]
 
     for turn in range(trainer.max_turn):
-        if not any(active_mask):
+        if sum(active_mask) == 0: # 如果所有样本都完成任务，则退出循环
             if trainer.accelerator.is_main_process:
                 logger.info(f'[Info]: all samples have completed the task at turn {turn + 1}.')
             break
         if trainer.accelerator.is_main_process:
             logger.info(f'[Interaction Turn]: {turn + 1}')
+            logger.info(f'[Active Samples]: {sum(active_mask)}')
+
         prompt_texts = [] # 需要批量处理的prompt
         for message in messages:
             if len(message) > (window_size + 1) * 2: # each turn has two messages from assistant and user, respectively
                 current_message = message[:2] + message[-window_size * 2:]
             else: current_message = message
 
-            message = convert_message_from_gpt_format(trainer=trainer, messages=current_message)
-            prompt_texts.append(maybe_apply_chat_template({"prompt": message}, trainer.processing_class)["prompt"]) # 禁用Qwen3的思考模式
+            try:
+                formatted_message = convert_message_from_gpt_format(trainer=trainer, messages=current_message)
+                prompt_texts.append(maybe_apply_chat_template({"prompt": formatted_message}, trainer.processing_class)["prompt"])
+            except Exception as e:
+                default_prompt = "system: An error occurred while processing the previous turn."
+                prompt_texts.append(default_prompt)
+                logger.warning(f"Error in converting message: {e}")
         
-
         prompt_inputs = trainer.processing_class(
             text=prompt_texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
@@ -195,16 +207,22 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         with unwrap_model_for_generation(
                 trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation
             ) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config
-                )
-                '''prompt_completion_idss.append(prompt_completion_ids)'''
+            with (
+                    FSDP.summon_full_params(trainer.model_wrapped, recurse=False)
+                    if trainer.is_fsdp_enabled
+                    else nullcontext()
+                ):
+                    prompt_completion_ids = unwrapped_model.generate(
+                        prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config
+                    )
 
         prompt_length = prompt_ids.size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
         
         '''completion_idss.append(completion_ids)'''
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        active_mask_copy = active_mask.copy() # 需要在for循环中修改active_mask，因此需要复制一份
         
         # 因为step是串行交互的，因此这里通过for循环转串行
         for idx in range(batch_size):
@@ -216,9 +234,8 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                     active_mask[idx] = False # 对应的样本已经完成任务
             else:
                 obss[idx].append(None)
-                # 把completion_ids[idx]中的每一个元素替换为pad_token_id。因为对已经交互结束的样本，我们不应该继续计算它的loss。
                 completion_ids[idx] = torch.full_like(completion_ids[idx], trainer.processing_class.pad_token_id)
-                prompt_completion_ids[idx][:, prompt_length:] = completion_ids[idx]
+                prompt_completion_ids[idx, prompt_length:] = completion_ids[idx]
 
         '''responsess.append(responses)'''
         '''candidate_actions : List[Dict[int, Action]] = [{
@@ -227,7 +244,10 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         } for i in range(iter)]'''
         # clean the last iter_num actions, and only keep the most consistent action
         # TODO: 需要解决self.get_most_consistent_action(candidate_actions)[0]返回的是一个元组，而不是一个Action的问题
-        actions: List[Action] = trainer.env.parsed_actions[-batch_size:] # 一共有batch_size个action，按response的顺序依次添加
+        
+        active_num = sum(active_mask_copy) # 上一轮active的样本数
+        active_idx = [idx for idx, mask in enumerate(active_mask_copy) if mask] # 目前active的样本的idx
+        actions: List[Action] = trainer.env.parsed_actions[-active_num:] # 一共有active_num个action，按response的顺序依次添加
         '''self.env.parsed_actions = self.env.parsed_actions[:-iter]
         self.env.parsed_actions.append(action)'''
         # get the response of the most consistent action by index
@@ -235,27 +255,43 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
         true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])'''
 
-        true_prompt_completion_ids.append(prompt_completion_ids) # true_prompt_completion_ids是num_turn个[batch_size, seq_len]的张量
-        true_completion_ids.append(completion_ids) # true_completion_ids是num_turn个[batch_size, seq_len]的张量
+        if turn == 0:
+            true_prompt_completion_ids.append(prompt_completion_ids) # true_prompt_completion_ids是num_turn个[batch_size, seq_len]的张量
+            true_completion_ids.append(completion_ids) # true_completion_ids是num_turn个[batch_size, seq_len]的张量
+            default_judge_list = [True] * batch_size # 这里的judge_list是一个batch的所有样本都没有完成任务
 
+        # 第二轮之后，如果一个batch里面都没有成功解析，就不加入最终的序列
+        else:
+            judge_list = []
+            for action in actions:
+                judge_list.append(isinstance(action, ErrorAction))
+            if judge_list != default_judge_list and sum(judge_list) != len(judge_list): # 出现了变化
+                true_prompt_completion_ids.append(prompt_completion_ids)
+                true_completion_ids.append(completion_ids)
+
+            if trainer.accelerator.is_main_process:
+                logger.info(f'[Judge List]: {judge_list}')
+                logger.info(f'[Default Judge List]: {default_judge_list}')
+            
+            default_judge_list = judge_list.copy()
+            
         if trainer.accelerator.is_main_process:
             logger.info(f'[Response]: {completion_texts[0]}')
 
         action_msgs = []
         obs_msgs = []
         
-        # 把action和obs转换成message
-        for action in actions:
-            if action is None:
-                action_msgs.append(None)
-            else:
-                action_msgs.append(action.convert_to_message(trainer.env.action_format, trainer.env.interact_protocol))
-        
+        # 把action和obs转换成message的格式
         for idx in range(batch_size):
             if obss[idx][-1] is not None: # 若obss[idx][-1]为None，则说明样本在第turn轮已经完成任务
                 obs_msgs.append(obss[idx][-1].convert_to_message())
             else:
                 obs_msgs.append(None) # 相当于padding
+            
+            if idx not in active_idx:
+                action_msgs.append(None) # 相当于padding
+            else:
+                action_msgs.append(actions[active_idx.index(idx)].convert_to_message(trainer.env.action_format, trainer.env.interact_protocol))
 
         if trainer.accelerator.is_main_process:
             logger.info(f"[Action]:{actions[0]}")
@@ -274,10 +310,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         for idx, (action_msg, obs_msg) in enumerate(zip(action_msgs, obs_msgs)):
             messages[idx].append(action_msg)
             messages[idx].append(obs_msg)
-        if flag: # whether task is completed
-            if trainer.accelerator.is_main_process:
-                logger.info(f'[Info]: early stop at interaction turn {turn + 1}.')
-            break
     
     if output_path is not None:
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -289,7 +321,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     for idx_1 in range(batch_size):
         for idx_2 in reversed(range(len(obss[idx_1]))):
             if obss[idx_1][idx_2] is not None:
-                real_obss.append(obss[idx_1][idx_2])
+                real_obss.append([obss[idx_1][idx_2]])
                 break
     
     if true_prompt_completion_ids is not None:
@@ -333,8 +365,11 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     if trainer.accelerator.is_main_process:
         print(first_dim_flattened_completion_ids.shape)
         print(first_dim_flattened_prompt_completion_ids.shape)
+    
+    if trainer.accelerator.is_main_process:
+        logger.info(f'[Pred]: {[truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))]}')
         
-    return [truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
+    return [truncate_tokens(str(obs.obs_content)) for obs in real_obss], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
 
 def crop_image_count_in_messages(
     trainer,
@@ -354,6 +389,8 @@ def crop_image_count_in_messages(
     """
     image_count = 0
     if not in_place: messages = copy.deepcopy(messages)
+
+    messages = [msg for msg in messages if msg is not None] 
 
     # images in the first two messages are maintained in the original order (usually system/task prompt)
     for i in range(min(keep_msg, len(messages))):
