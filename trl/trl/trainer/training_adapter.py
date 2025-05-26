@@ -116,13 +116,16 @@ def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 
         if prompt_len + completion_len < prompt_completion_len:
             # 需要填充
             pad_len = prompt_completion_len - (prompt_len + completion_len)
-            attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (0, pad_len), value=0)
+            attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (pad_len, 0), value=0)
         else:
             # 需要截断
             attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]
 
     # 拼接 attention_mask
     attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)
+
+    if trainer.accelerator.is_main_process: 
+        logger.info(f'[Prompt Completion IDs]: {prompt_completion_ids.shape}')
 
     return completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos
 
@@ -133,8 +136,9 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     true_prompt_completion_ids = []
     true_completion_ids = []
     default_judge_list = []
-
     batch_size = len(messages)
+    prompt_completion_ids_list = [[] for _ in range(batch_size)]
+    completion_ids_list = [[] for _ in range(batch_size)]
 
     if trainer.accelerator.is_main_process:
         logger.info(f'[Batch Size]: {batch_size}')
@@ -180,29 +184,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         responsess = []
         prompt_completion_idss = []
         completion_idss = []
-        '''for _ in range(iter):
-            # 使用GRPO的生成方法替代model.get_response
-            # 参考Agent框架里面的convert_message_from_gpt_format，做出裁剪。
-            with unwrap_model_for_generation(
-                self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-            ) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                )
-                prompt_completion_idss.append(prompt_completion_ids)
-
-            prompt_length = prompt_ids.size(1)
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-            
-            completion_idss.append(completion_ids)
-            completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
-            
-            # 因为step是串行交互的，因此这里通过for循环转串行
-            responses = completion_texts
-            for response in responses:
-                obs, _, flag, _ = self.env.step(response, **output_kwargs)
-                obss.append(obs)
-                flags.append(flag)'''
 
         with unwrap_model_for_generation(
                 trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation
@@ -219,7 +200,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         prompt_length = prompt_ids.size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
         
-        '''completion_idss.append(completion_ids)'''
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
         active_mask_copy = active_mask.copy() # 需要在for循环中修改active_mask，因此需要复制一份
@@ -237,43 +217,24 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 completion_ids[idx] = torch.full_like(completion_ids[idx], trainer.processing_class.pad_token_id)
                 prompt_completion_ids[idx, prompt_length:] = completion_ids[idx]
 
-        '''responsess.append(responses)'''
-        '''candidate_actions : List[Dict[int, Action]] = [{
-            "idx": i,
-            "action": self.env.parsed_actions[-i:]
-        } for i in range(iter)]'''
         # clean the last iter_num actions, and only keep the most consistent action
-        # TODO: 需要解决self.get_most_consistent_action(candidate_actions)[0]返回的是一个元组，而不是一个Action的问题
         
         active_num = sum(active_mask_copy) # 上一轮active的样本数
         active_idx = [idx for idx, mask in enumerate(active_mask_copy) if mask] # 目前active的样本的idx
         actions: List[Action] = trainer.env.parsed_actions[-active_num:] # 一共有active_num个action，按response的顺序依次添加
-        '''self.env.parsed_actions = self.env.parsed_actions[:-iter]
-        self.env.parsed_actions.append(action)'''
-        # get the response of the most consistent action by index
-        '''responses = responsess[self.get_most_consistent_action(candidate_actions)[1]]
-        true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
-        true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])'''
 
         if turn == 0:
-            true_prompt_completion_ids.append(prompt_completion_ids) # true_prompt_completion_ids是num_turn个[batch_size, seq_len]的张量
-            true_completion_ids.append(completion_ids) # true_completion_ids是num_turn个[batch_size, seq_len]的张量
-            default_judge_list = [True] * batch_size # 这里的judge_list是一个batch的所有样本都没有完成任务
+            for idx in range(batch_size):
+                prompt_completion_ids_list[idx].append(prompt_completion_ids[idx])
+                completion_ids_list[idx].append(completion_ids[idx])
 
         # 第二轮之后，如果一个batch里面都没有成功解析，就不加入最终的序列
         else:
-            judge_list = []
-            for action in actions:
-                judge_list.append(isinstance(action, ErrorAction))
-            if judge_list != default_judge_list and sum(judge_list) != len(judge_list): # 出现了变化
-                true_prompt_completion_ids.append(prompt_completion_ids)
-                true_completion_ids.append(completion_ids)
-
-            if trainer.accelerator.is_main_process:
-                logger.info(f'[Judge List]: {judge_list}')
-                logger.info(f'[Default Judge List]: {default_judge_list}')
-            
-            default_judge_list = judge_list.copy()
+            for idx in range(batch_size):
+                if idx not in active_idx: continue
+                if isinstance(actions[active_idx.index(idx)], ErrorAction) is False: # 如果成功解析出动作，那就加入
+                    prompt_completion_ids_list[idx].append(completion_ids[idx])
+                    completion_ids_list[idx].append(completion_ids[idx])
             
         if trainer.accelerator.is_main_process:
             logger.info(f'[Response]: {completion_texts[0]}')
@@ -296,14 +257,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         if trainer.accelerator.is_main_process:
             logger.info(f"[Action]:{actions[0]}")
 
-        '''if isinstance(obs_msg['content'], list): # array of messages, see doc: https://platform.openai.com/docs/guides/vision#uploading-base64-encoded-images
-            for obs_msg_content_item in obs_msg['content']:
-                if obs_msg_content_item['type'] == 'text':
-                    #logger.info(obs_msg_content_item['text'])
-                    pass
-        else:
-            logger.info(obs_msg['content'])'''
-
         # update history messages
 
         # 分发给batch中的每个Q
@@ -317,21 +270,25 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 f.write(json.dumps(m, ensure_ascii=False) + '\n')
 
     # 对obss进行处理，把最后的非None值保留作为这个response的prev_answer.
-    real_obss = [] # [batch_size, 1]
+    real_obss = [] # [batch_size]
     for idx_1 in range(batch_size):
         for idx_2 in reversed(range(len(obss[idx_1]))):
             if obss[idx_1][idx_2] is not None:
-                real_obss.append([obss[idx_1][idx_2]])
+                real_obss.append(obss[idx_1][idx_2])
                 break
     
-    if true_prompt_completion_ids is not None:
-        # 如果列表非空，将所有张量拼接为一个[batch_size, turn_num * seq_len]的张量
-        first_dim_flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=1)
-        first_dim_flattened_completion_ids = torch.cat(true_completion_ids, dim=1)
-    else:
-        # 如果列表为空，创建空张量
-        first_dim_flattened_prompt_completion_ids = torch.tensor([], device=trainer.accelerator.device)
-        first_dim_flattened_completion_ids = torch.tensor([], device=trainer.accelerator.device)
+    for idx in range(batch_size):
+        # 只拼接最后五个成功解析的动作
+        if len(prompt_completion_ids_list[idx]) >= 5:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-3:]
+            completion_ids_list[idx] = completion_ids_list[idx][-3:]
+        
+        prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
+        completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
+    
+    # 得到[batch_size, max_effective_turn * seq_len]的张量
+    first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
+    first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
         
     # 处理flattened张量中的EOS标记，只保留最后一个
     def replace_all_but_last_eos(tensor, eos_token_id, pad_token_id):
@@ -367,7 +324,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         print(first_dim_flattened_prompt_completion_ids.shape)
     
     if trainer.accelerator.is_main_process:
-        logger.info(f'[Pred]: {[truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))]}')
+        logger.info(f'[Pred]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
         
     return [truncate_tokens(str(obs.obs_content)) for obs in real_obss], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
 

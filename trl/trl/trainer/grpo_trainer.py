@@ -461,7 +461,7 @@ class GRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)
+            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
         
@@ -1192,7 +1192,7 @@ class GRPOTrainer(Trainer):
                     else:
                         texts = [p + c for p, c in zip(prompts, completions)]
                     reward_inputs = reward_processing_class(
-                        text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                        text=texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
