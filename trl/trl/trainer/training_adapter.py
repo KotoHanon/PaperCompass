@@ -278,8 +278,8 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        # 只拼接最后五个成功解析的动作
-        if len(prompt_completion_ids_list[idx]) >= 5:
+        # 只拼接最后3个成功解析的动作
+        if len(prompt_completion_ids_list[idx]) >= 3:
             prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-3:]
             completion_ids_list[idx] = completion_ids_list[idx][-3:]
         

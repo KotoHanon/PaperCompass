@@ -4,6 +4,7 @@ from utils.hyperparam_utils import parse_args, get_result_folder, get_result_log
 from typing import List, Dict, Any
 import sys
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"  # 设置可见的GPU设备
 from argparse import Namespace
 import argparse, logging
 import torch
@@ -18,12 +19,14 @@ sys.path.append(trl_path)
 
 from trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trainer.grpo_config import GRPOConfig
-from transformers import AutoModelForCausalLM # AutoConfig 也可能有用
+from transformers import AutoModelForCausalLM, AutoTokenizer # AutoConfig 也可能有用
 from evaluation.evaluator import evaluate_airqa
 
 tiktoken_cache_dir = "."
 os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
 cache_key = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
+os.environ['VLLM_API_KEY'] = "lococo"
+os.environ['VLLM_BASE_URL'] = "http://localhost:8000/v1"
 # validate
 assert os.path.exists(os.path.join(tiktoken_cache_dir, cache_key))
 
@@ -39,7 +42,7 @@ args.database_dir = os.path.join(current_dir, "data/database/ai_research/")
 args.vectorstore_dir = os.path.join(current_dir, "data/vectorstore/ai_research/")
 args.launch_method = "standalone"
 args.docker_uri = None
-args.max_turn = 10
+args.max_turn = 2
 args.example = "airqa_example"
 args.db_format = "create_sql"
 args.vs_format = "detailed_json"
@@ -60,7 +63,8 @@ model_list = ["./.cache/Qwen2.5-3B-OurInstruct", "./.cache/Qwen2.5-7B-OurInstruc
 model = AutoModelForCausalLM.from_pretrained(
     pretrained_model_name_or_path=model_list[0],
     torch_dtype=torch.bfloat16,
-    attn_implementation="sdpa",
+    attn_implementation="flash_attention_2",
+    use_cache = False
 )
 
 config = GRPOConfig(
@@ -69,6 +73,7 @@ config = GRPOConfig(
     gradient_accumulation_steps=4,
     wandb_log_unique_prompts=True,
     max_completion_length=1024,
+    max_prompt_length=8192,
     bf16=True,
     max_steps=100,
 )

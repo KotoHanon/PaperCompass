@@ -4,61 +4,6 @@ import re, json, os, sys
 import fuzzywuzzy.fuzz as fuzz
 from typing import Any, Dict, List, Tuple, Optional, Union
 from openai.types.chat.chat_completion import ChatCompletion
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
-
-def load_local_model_and_tokenizer(model_name_or_path: str):
-
-    print(f"Loading model: {model_name_or_path}. This may take a while...")
-    try:
-        _local_tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=True
-        )
-        _local_model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype="auto",
-            trust_remote_code=True
-        )
-        _loaded_model_name_or_path = model_name_or_path
-        print(f"Model {model_name_or_path} loaded successfully on device: {_local_model.device}")
-    except Exception as e:
-        print(f"Error loading local model {model_name_or_path}: {e}")
-
-        _local_model = None
-        _local_tokenizer = None
-        _loaded_model_name_or_path = None
-        raise
-    return _local_tokenizer, _local_model
-
-def call_local_llm_with_message(
-    messages: Any,
-    model_name_or_path: str,
-    top_p: float= 0.95,
-    temperature: float = 0.7,
-    max_new_tokens=100
-):
-    tokenizer, model = load_local_model_and_tokenizer(model_name_or_path)
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False
-    )
-
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-        )
-    response_tokens = outputs[0][inputs['input_ids'].shape[-1]:]
-    response = tokenizer.decode(response_tokens, skip_special_tokens=True)
-
-    return response.strip()
 
 try:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -72,8 +17,8 @@ except:
     ) -> str:
         """ Call LLM to generate the response directly using the message list.
         """
-        api_key = os.getenv('OPENAI_API_KEY', None)
-        base_url = os.getenv('OPENAI_BASE_URL', None)
+        api_key = os.getenv('VLLM_API_KEY', None)
+        base_url = os.getenv('VLLM_BASE_URL', None)
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
         completion: ChatCompletion = client.chat.completions.create(
             messages,
@@ -84,7 +29,7 @@ except:
         return completion.choices[0].message.content.strip()
 
 
-DEFAULT_LLM_MODEL = '.cache/Qwen3-0.6B'
+DEFAULT_LLM_MODEL = 'qwen'
 DEFAULT_TEMPERATURE = 0.0
 
 
@@ -96,7 +41,7 @@ def _eval_with_llm(template, llm_model, temperature, target: str = 'true') -> fl
         {"role": "system", "content": system_msg},
         {"role": "user", "content": user_msg}
     ]
-    llm_output = call_local_llm_with_message(messages, llm_model, temperature=temperature)
+    llm_output = call_llm_with_message(messages, llm_model, temperature=temperature)
     # Extract the final judgement
     matched = re.findall(r'```(txt)?\s(.*?)\s```', llm_output, re.DOTALL)
     if len(matched) == 0:
