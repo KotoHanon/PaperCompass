@@ -1,0 +1,6 @@
+db_format: create_sql
+vs_format: detailed_json
+action_format: markdown
+output_format: json
+method: neusym_rag
+interact_protocol: react

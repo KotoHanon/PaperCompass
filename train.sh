@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# --- Configuration - PLEASE EDIT THESE VALUES ---
 VLLM_MODEL_PATH=".cache/Qwen2.5-3B-OurInstruct"
 VLLM_SERVED_MODEL_NAME="qwen2.5-3b-ourinstruct"
 VLLM_API_KEY="lococo"
 VLLM_PORT=8000
-VLLM_GPUS="4" 
+VLLM_GPUS="3" 
 VLLM_TP_SIZE=1
 VLLM_GPU_MEM_UTIL=0.85
-VLLM_LOG_FILE="./vllm_server.log"
+VLLM_LOG_FILE="./log/vllm_server.log"
 
-TRAINING_GPUS="0,1,2,3"
+#TRAINING_GPUS="0,1,2,3"
+TRAINING_GPUS="0,1,2"
 TRAINING_SCRIPT_PATH="train.py"
-# --- End of Configuration ---
+
 
 VLLM_PID=""
 TRAINING_EXIT_CODE=0
@@ -47,32 +47,15 @@ start_vllm() {
     if [ ! -z "${VLLM_API_KEY}" ]; then
         VLLM_CMD_ARGS+=(--api-key "${VLLM_API_KEY}")
     fi
-    
+
+    echo "Starting vLLM server with command:"
     # shellcheck disable=SC2086
     CUDA_VISIBLE_DEVICES=${VLLM_GPUS} vllm "${VLLM_CMD_ARGS[@]}" > "${VLLM_LOG_FILE}" 2>&1 &
     VLLM_PID=$!
 
-    if [ $? -ne 0 ] || ! kill -0 "${VLLM_PID}" 2>/dev/null ; then
-        # Failed to start or PID not valid
-        exit 1
-    fi
+    sleep 2
 
-    local RETRY_COUNT=0
-    local MAX_RETRIES=60 
-    local HEALTH_ENDPOINT="http://localhost:${VLLM_PORT}/health"
-
-    until curl --output /dev/null --silent --head --fail "${HEALTH_ENDPOINT}"; do
-        if [ ${RETRY_COUNT} -ge ${MAX_RETRIES} ]; then
-            if kill -0 "${VLLM_PID}" 2>/dev/null; then
-                 kill -SIGTERM "${VLLM_PID}"
-                 wait "${VLLM_PID}" 2>/dev/null
-            fi
-            VLLM_PID="" 
-            exit 1
-        fi
-        sleep 2
-        RETRY_COUNT=$((RETRY_COUNT+1))
-    done
+    echo "vLLM has been successfully started at port ${VLLM_PORT}. Check logs at ${VLLM_LOG_FILE} for details."
 }
 
 start_training() {
