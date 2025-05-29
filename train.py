@@ -22,6 +22,8 @@ os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
 cache_key = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
 os.environ['VLLM_API_KEY'] = "lococo"
 os.environ['VLLM_BASE_URL'] = "http://localhost:8000/v1"
+os.environ["TOWHEE_HOME"] = "./.towhee"
+os.environ["NLTK_DATA"] = "./nltk_data"
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
@@ -32,6 +34,7 @@ def reward_func_adapter(prompts, completions, **reward_kwargs):
         gold_answer = json.loads(gold_str)
         score = evaluate_airqa(pred_answer=completion, gold=gold_answer)
         rewards.append(float(score))
+        '''rewards.append(0.0)  # Placeholder for actual reward calculation'''
     return rewards
 
 @hydra.main(config_path="configs", config_name="train_config", version_base=None)
@@ -53,6 +56,8 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
         max_prompt_length=cfg.max_prompt_length,
         max_steps=cfg.max_steps,
         bf16=True,
+        temperature=cfg.temperature,
+        top_p=cfg.top_p,
     )
 
     trainer = GRPOTrainer(
@@ -73,6 +78,7 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
         db_format=cfg.db_format,
         vs_format=cfg.vs_format,
         action_format=cfg.action_format,
+        window_size=cfg.window_size,
     )
 
     trainer.train()

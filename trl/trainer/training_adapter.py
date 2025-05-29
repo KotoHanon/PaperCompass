@@ -62,16 +62,19 @@ from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 import logging, json, tiktoken
 
-def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.messages = []
-    for example in inputs:
+    for idx, example in enumerate(inputs):
         task_prompt, image_messages = formulate_input(trainer.dataset, example, use_pdf_id=True)
+        if trainer.accelerator.is_main_process:
+            if idx == 0:
+                logger.info(f'[Task Prompt]: {task_prompt}')
 
-        task_prompt = "\n".join([
+        '''task_prompt = "\n".join([
             task_prompt,
             f"[Database Schema]: {trainer.database_prompt}",
             f"[Vectorstore Schema]: {trainer.vectorstore_prompt}"
-        ])
+        ])'''
         if image_messages:
             task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
         trainer.messages.append([
@@ -79,7 +82,7 @@ def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 
             {'role': 'user', 'content': task_prompt}
         ])
 
-    completions_texts, prompt_completion_ids, completion_ids = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, use_consistency_selection=False, consistency_N=1, logger=logger)
+    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
 
     # we pad for: 1. everyone after the first eos token, and 2. pad_token_id for the rest
     is_eos = completion_ids == trainer.processing_class.eos_token_id
@@ -101,8 +104,12 @@ def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 
     prompt_completion_len = prompt_completion_ids.size(1)
     prompt_len = prompt_ids.size(1)
     completion_len = completion_ids.size(1)
+    logger.info(f'[Prompt Completion IDs]: {prompt_completion_ids.shape}')
 
-    if prompt_len + completion_len != prompt_completion_len:
+    assert prompt_completion_len == prompt_len + completion_len, \
+        f'Prompt completion length {prompt_completion_len} does not match the sum of prompt length {prompt_len} and completion length {completion_len}.'
+
+    '''if prompt_len + completion_len != prompt_completion_len:
         # pad or truncate the attention mask
         if prompt_len + completion_len < prompt_completion_len:
             # pad(padding_side = 'left' for flash_attention_2!) 
@@ -110,22 +117,20 @@ def adaption_layer(trainer, inputs, prompt_ids, prompt_mask, window_size: int = 
             attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (pad_len, 0), value=0)
         else:
             # truncate
-            attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]
-
+            attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]'''
     # concatenate the attention mask
     attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)
-
-    if trainer.accelerator.is_main_process: 
-        logger.info(f'[Prompt Completion IDs]: {prompt_completion_ids.shape}')
 
     return completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos
 
 
-def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.env.reset()
     batch_size = len(messages)
     prompt_completion_ids_list = [[] for _ in range(batch_size)]
     completion_ids_list = [[] for _ in range(batch_size)]
+    initial_prompt_ids = None
+    initial_prompt_mask = None
 
     if trainer.accelerator.is_main_process:
         logger.info(f'[Batch Size]: {batch_size}')
@@ -166,13 +171,16 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         if trainer.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -trainer.max_prompt_length:]
             prompt_mask = prompt_mask[:, -trainer.max_prompt_length:]
+            if turn == 0:
+                initial_prompt_ids = prompt_ids
+                initial_prompt_mask = prompt_mask
 
         with unwrap_model_for_generation(trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation) as unwrapped_model:
             with (FSDP.summon_full_params(trainer.model_wrapped, recurse=False) if trainer.is_fsdp_enabled else nullcontext()):
                     prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config)
 
         prompt_length = prompt_ids.size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]       
+        completion_ids = prompt_completion_ids[:, prompt_length:]   
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
         active_mask_copy = active_mask.copy()
@@ -195,7 +203,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
 
         if turn == 0:
             for idx in range(batch_size):
-                prompt_completion_ids_list[idx].append(prompt_completion_ids[idx]) # we just record the initial prompt
+                prompt_completion_ids_list[idx].append(completion_ids[idx]) # we just record the initial prompt
                 completion_ids_list[idx].append(completion_ids[idx])
 
         else:
@@ -224,6 +232,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
 
         if trainer.accelerator.is_main_process:
             logger.info(f"[Action]:{actions[0]}")
+            logger.info(f"[Observation]:{obs_msgs[0]['content'] if obs_msgs[0] is not None else 'None'}")
 
         # update history messages
         for idx, (action_msg, obs_msg) in enumerate(zip(action_msgs, obs_msgs)):
@@ -245,10 +254,12 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        if len(prompt_completion_ids_list[idx]) >= 3:
-            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-3:]
-            completion_ids_list[idx] = completion_ids_list[idx][-3:]
+        if len(prompt_completion_ids_list[idx]) >= 10:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-10:]
+            completion_ids_list[idx] = completion_ids_list[idx][-10:]
         
+        prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
+
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
     
@@ -286,7 +297,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     if trainer.accelerator.is_main_process:
         logger.info(f'[Pred]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
         
-    return [truncate_tokens(str(obs.obs_content)) for obs in real_obss], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids
+    return [truncate_tokens(str(obs.obs_content)) for obs in real_obss], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids, initial_prompt_ids, initial_prompt_mask
 
 def crop_image_count_in_messages(
     trainer,
