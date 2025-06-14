@@ -551,7 +551,7 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences(self, prompts: DataProto):
+    def generate_sequences(self, prompts: DataProto, env: AgentEnv):
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -570,7 +570,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(prompts=prompts, env=env)
             output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")

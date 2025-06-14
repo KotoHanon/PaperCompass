@@ -58,6 +58,14 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
+from agents.envs import infer_env_class, AgentEnv
+from agents.models import infer_model_class, LLMClient
+from agents.frameworks import infer_agent_class, AgentBase
+from agents.prompts import convert_database_schema_to_prompt, convert_vectorstore_schema_to_prompt
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
 WorkerType = Type[Worker]
 
 
@@ -318,6 +326,31 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader()
+
+        # Datasets
+        self.dataset = self.config.data.get("dataset", "airqa")
+        self.database = self.config.agent.get("database", "ai_research")
+        self.vectorstore = self.config.agent.get("vectorstore", "airqa")
+        self.db_format = self.config.agent.get("db_format", "create_sql")
+        self.vs_format = self.config.agent.get("vs_format", "detailed_json")
+        self.database_prompt = convert_database_schema_to_prompt(self.database, serialize_method=self.db_format)
+        self.vectorstore_prompt = convert_vectorstore_schema_to_prompt(self.vectorstore, serialize_method=self.vs_format, add_description=False)
+        self.action_format = self.config.agent.get("action_format", "markdown")
+        self.interact_protocol = self.config.agent.get("interact_protocol", "react")
+        self.launch_method = self.config.agent.get("launch_method", "standalone")
+        self.database_dir = "/hpc_stor03/sjtu_home/zijian.wang/Neusym-RAG-RL/NeuSym-RAG-RL/NeuSym-RAG/data/database/ai_research"
+        self.vectorstore_dir = "/hpc_stor03/sjtu_home/zijian.wang/Neusym-RAG-RL/NeuSym-RAG-RL/NeuSym-RAG/data/vectorstore/ai_research"
+
+        self.env: AgentEnv = infer_env_class('neusym_rag')(
+            dataset=self.dataset,
+            action_format=self.action_format,
+            interact_protocol=self.interact_protocol,
+            database=self.database,
+            vectorstore=self.vectorstore,
+            database_path=os.path.join(self.database_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".duckdb"),
+            launch_method=self.launch_method,
+            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".db"),
+        )
 
     def _validate_config(self):
         config = self.config
@@ -632,7 +665,7 @@ class RayPPOTrainer:
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
             if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded, env)
             else:
                 await self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = await self.async_rollout_manager.generate_sequences(
@@ -980,7 +1013,7 @@ class RayPPOTrainer:
                     # generate a batch
                     with _timer("gen", timing_raw):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch, env)
                         else:
                             await self.async_rollout_manager.wake_up()
                             gen_batch_output = await self.async_rollout_manager.generate_sequences(gen_batch)
@@ -990,7 +1023,7 @@ class RayPPOTrainer:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch, env)
 
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)

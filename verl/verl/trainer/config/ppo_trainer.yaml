@@ -1,3 +1,17 @@
+agent:
+  image_limit: 10
+  length_limit: 32
+  dataset: airqa
+  agent_method: neusym_rag
+  num_turns: 20
+  database: ai_research
+  vectorstore: airqa,
+  launch_method: standalone,
+  action_format: markdown,
+  interact_protocol: react,
+  vs_format: detailed_json,
+  db_format: create_sql,
+
 data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
