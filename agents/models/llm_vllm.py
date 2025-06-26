@@ -3,6 +3,7 @@ import copy, os, json
 from typing import List, Dict, Tuple, Any, Optional
 from openai.types.chat.chat_completion import ChatCompletion
 from openai import OpenAI
+import openai
 from agents.models.llm_base import LLMClient
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
@@ -81,14 +82,15 @@ class VLLMClient(LLMClient):
         'llama-3.2-90b-vision-instruct': os.path.join(CACHE_DIR, 'Llama-3.2-90B-Vision-Instruct'),
         'llama-3.3-70b-instruct': os.path.join(CACHE_DIR, 'Llama-3.3-70B-Instruct'),
         'qwen2.5-3b-ourinstruct': os.path.join("./.cache", 'Qwen2.5-3B-OurInstruct'),
+        'qwen2.5-7b-ourinstruct': os.path.join("./.cache", 'Qwen2.5-7B-OurInstruct'),
     }
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, image_limit: int = 10, length_limit: int = 32, **kwargs) -> None:
         super(VLLMClient, self).__init__()
         if api_key is None:
-            api_key = os.environ['VLLM_API_KEY']
+            api_key = os.environ['VLLM_EVAL_API_KEY']
         if base_url is None and os.environ.get('VLLM_BASE_URL', None) is not None:
-            base_url = os.environ['VLLM_BASE_URL']
+            base_url = os.environ['VLLM_EVAL_BASE_URL']
         self._client: OpenAI = OpenAI(api_key=api_key, base_url=base_url)
         self.image_limit, self.length_limit = image_limit, length_limit
         keys = list(kwargs.keys())
@@ -146,7 +148,17 @@ class VLLMClient(LLMClient):
     ) -> str:
         """ Get the response string from the local model launched using vLLM.
         """
-        if model.lower().startswith('deepseek'):
+        api_key = os.getenv('VLLM_EVAL_API_KEY', None)
+        base_url = os.getenv('VLLM_EVAL_BASE_URL', None)
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        completion: ChatCompletion = client.chat.completions.create(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens
+        )
+        '''if model.lower().startswith('deepseek'):
             messages, temperature = deepseek_fixup(messages, temperature)
         completion: ChatCompletion = self._client.chat.completions.create(
             messages=messages,
@@ -154,17 +166,8 @@ class VLLMClient(LLMClient):
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens
-        )
+        )'''
         response = completion.choices[0].message.content.strip()
         self.update_usage(completion)
         return response
-        '''llm = AutoModelForCausalLM.from_pretrained(self.model_path[model])
-        tokenizer = AutoTokenizer.from_pretrained(self.model_path[model])
-        prompts = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(prompts, return_tensors='pt')
-        with torch.no_grad():
-            outputs = llm.generate(**inputs, max_new_tokens=max_tokens, temperature=temperature, top_p=top_p)
 
-        response = outputs[0][inputs['input_ids'].shape[-1]:]
-        #self.update_usage(outputs)
-        return response'''

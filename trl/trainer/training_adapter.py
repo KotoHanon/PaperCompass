@@ -34,7 +34,7 @@ from transformers.utils import is_datasets_available, is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..extras.vllm_client import VLLMClient
+#from ..extras.vllm_client import VLLMClient
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
@@ -64,6 +64,10 @@ import logging, json, tiktoken
 
 def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.messages = []
+    NEUSYM_RAG_SYSTEM_PROMPT = """You are an intelligent agent with expertise in **retrieving useful context from both the DuckDB database and the Milvus vectorstore through SQL execution and similarity search** and **answering user questions**. You will be given a natural language question concerning PDF files, along with the schema of both the database and the vectorstore. Your ultimate goal is to answer the input question with pre-defined answer format. The DuckDB database contains all parsed content of raw PDF files, while the Milvus vectorstore encodes specific column cells from the database as vectors. You can predict executable actions, interact with the hybrid environment (including database and vectorstore) across multiple turns, and retrieve necessary context until you are confident in resolving the question.
+[Database Schema]: A detailed serialized schema of the DuckDB database for reference when generating SQL queries. It includes 1) tables, 2) columns and their data types, 3) descriptions for these schema items, and 4) primary key and foreign key constraints.
+[Vectorstore Schema]: A detailed serialized schema of the Milvus vectorstore for reference when generating executable retrieval actions with specific parameters. It includes 1) collections, 2) fields, 3) encodable (table, column) pairs in the relational database where the vectorized content originates, and 4) grammar for valid filter rules.
+"""
     for idx, example in enumerate(inputs):
         task_prompt, image_messages = formulate_input(trainer.dataset, example, use_pdf_id=True)
         if trainer.accelerator.is_main_process:
@@ -79,6 +83,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
         trainer.messages.append([
             {'role': 'system', 'content': trainer.agent_prompt},
+            #{'role': 'system', 'content': NEUSYM_RAG_SYSTEM_PROMPT},
             {'role': 'user', 'content': task_prompt}
         ])
 
@@ -104,21 +109,10 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
     prompt_completion_len = prompt_completion_ids.size(1)
     prompt_len = prompt_ids.size(1)
     completion_len = completion_ids.size(1)
-    logger.info(f'[Prompt Completion IDs]: {prompt_completion_ids.shape}')
 
     assert prompt_completion_len == prompt_len + completion_len, \
         f'Prompt completion length {prompt_completion_len} does not match the sum of prompt length {prompt_len} and completion length {completion_len}.'
 
-    '''if prompt_len + completion_len != prompt_completion_len:
-        # pad or truncate the attention mask
-        if prompt_len + completion_len < prompt_completion_len:
-            # pad(padding_side = 'left' for flash_attention_2!) 
-            pad_len = prompt_completion_len - (prompt_len + completion_len)
-            attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (pad_len, 0), value=0)
-        else:
-            # truncate
-            attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]'''
-    # concatenate the attention mask
     attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)
 
     return completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos
@@ -131,6 +125,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     completion_ids_list = [[] for _ in range(batch_size)]
     initial_prompt_ids = None
     initial_prompt_mask = None
+    full_completion_texts = []
 
     if trainer.accelerator.is_main_process:
         logger.info(f'[Batch Size]: {batch_size}')
@@ -161,8 +156,11 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 prompt_texts.append(default_prompt)
                 logger.warning(f"Error in converting message: {e}")
         
-        prompt_inputs = trainer.processing_class(
+        '''prompt_inputs = trainer.processing_class(
             text=prompt_texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )'''
+        prompt_inputs = trainer.processing_class(
+            text=prompt_texts, return_tensors="pt", padding=True, add_special_tokens=False
         )
         # prompt_inputs.shape -> [batch_size, emb_size]
         prompt_inputs = prepare_input_function(prompt_inputs)
@@ -212,6 +210,9 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 if isinstance(actions[active_idx.index(idx)], ErrorAction) is False: # append if the action is not an instance of ErrorAction
                     prompt_completion_ids_list[idx].append(completion_ids[idx])
                     completion_ids_list[idx].append(completion_ids[idx])
+        
+        completion_texts = [text + "[/Action]" for text in completion_texts]
+        full_completion_texts.append(completion_texts)
             
         if trainer.accelerator.is_main_process:
             logger.info(f'[Response]: {completion_texts[0]}')
@@ -263,9 +264,11 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
     
-    first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
-    first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
+    #first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
+    #first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
         
+    first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id)
+    first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id)
     # only keep the last EOS token in each sample, replace others with PAD token
     def replace_all_but_last_eos(tensor, eos_token_id, pad_token_id):
         if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
@@ -294,10 +297,14 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         print(first_dim_flattened_completion_ids.shape)
         print(first_dim_flattened_prompt_completion_ids.shape)
     
+    logger.info(f'[Pred from {trainer.accelerator.process_index}]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
+    completion_texts = [''.join(column) for column in zip(*full_completion_texts)] # concatenate the completion texts for each sample
+    completion_texts = [text + "\n" + "[Observation]: " + truncate_tokens(str(obs.obs_content)) + "[/Observation]" for text, obs in zip(completion_texts, real_obss)]
+
     if trainer.accelerator.is_main_process:
-        logger.info(f'[Pred]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
+        logger.info(f'[Completion Texts]: {completion_texts}')
         
-    return [truncate_tokens(str(obs.obs_content)) for obs in real_obss], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids, initial_prompt_ids, initial_prompt_mask
+    return completion_texts, first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids, initial_prompt_ids, initial_prompt_mask
 
 def crop_image_count_in_messages(
     trainer,

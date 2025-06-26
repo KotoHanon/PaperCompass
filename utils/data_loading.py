@@ -3,11 +3,9 @@ from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
 from utils.eval_utils import evaluate, print_result, load_test_data, write_jsonl
 
-def load_data(data_path: str = "test_data_553.jsonl", dataset_name: str = "airqa"):
-    #args: Namespace = parse_args()
+def load_data(data_path: str = "test_data_553.jsonl", dataset_name: str = "airqa") -> Dataset:
     data: List[Dict[str, Any]] = load_test_data(data_path, dataset_name)
     formatted_data = []
-    # TODO: 这里的数据集构造非常冗余，后续细化的时候再处理
     for item in data:
         if "prompt" not in item:
             formatted_data.append({"prompt": item.get("question") + ' ' + item.get("answer_format"), "question": item.get("question"), "answer_format": item.get("answer_format"), 
@@ -36,8 +34,4 @@ def load_data(data_path: str = "test_data_553.jsonl", dataset_name: str = "airqa
 
     dataset = Dataset.from_list(raw_data)
 
-    train_test_split = dataset.train_test_split(test_size=0.1, seed=114514)
-    train_dataset = train_test_split["train"]
-    eval_dataset = train_test_split["test"]
-
-    return train_dataset, eval_dataset
+    return dataset

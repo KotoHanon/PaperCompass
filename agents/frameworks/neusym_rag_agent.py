@@ -7,7 +7,6 @@ from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 from agents.frameworks.agent_base import AgentBase
 
-
 logger = logging.getLogger()
 
 

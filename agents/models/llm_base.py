@@ -56,15 +56,9 @@ class LLMClient(abc.ABC):
             'max_tokens': max_tokens,
             **kwargs
         }
-        hashed_key = self.cache.hash_params(params)
-        cached_response = self.cache.get(hashed_key)
-        if cached_response is not None: # hit cache
-            return cached_response
-        else:
-            messages = self.convert_message_from_gpt_format(messages, model)
-            response = self._get_response(messages, model, temperature, top_p, max_tokens)
-            self.cache.insert(hashed_key, params, response)
-            return response
+        messages = self.convert_message_from_gpt_format(messages, model)
+        response = self._get_response(messages, model, temperature, top_p, max_tokens)
+        return response
 
 
     @abc.abstractmethod

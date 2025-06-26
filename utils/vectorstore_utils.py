@@ -111,6 +111,8 @@ def get_milvus_embedding_function(
         return GLOBAL_EMBEDDING_MODELS[(embed_type, embed_model, str(backup_json))]
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    local_rank = int(os.environ.get("LOCAL_RANK", 0)) 
+    #device = f'npu:{local_rank}'
     embed_model = detect_embedding_model_path(embed_model) if embed_type != 'bm25' else embed_model
 
     if embed_type == 'sentence_transformers':

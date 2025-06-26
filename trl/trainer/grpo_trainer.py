@@ -49,7 +49,7 @@ from transformers.utils import is_datasets_available, is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..extras.vllm_client import VLLMClient
+#from ..extras.vllm_client import VLLMClient
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
@@ -85,9 +85,10 @@ if is_peft_available():
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
 
-if is_wandb_available():
-    import wandb
-    wandb.login(key=API_KEY)
+'''if is_wandb_available():
+    #import wandb
+    #wandb.login(key=API_KEY)
+    pass'''
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -462,7 +463,8 @@ class GRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            '''processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")'''
+            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
         
@@ -618,6 +620,17 @@ class GRPOTrainer(Trainer):
                 use_ref_model=self.ref_model is not None,
             )
 
+        '''super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )'''
+
         super().__init__(
             model=model,
             args=args,
@@ -642,8 +655,7 @@ class GRPOTrainer(Trainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
-        #self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
-        self.wandb_log_unique_prompts = True
+        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
@@ -655,9 +667,9 @@ class GRPOTrainer(Trainer):
             interact_protocol=interact_protocol,
             database=database,
             vectorstore=vectorstore,
-            database_path=os.path.join(self.database_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".duckdb"),
+            database_path=os.path.join(self.database_dir, "ai_research.14017." + str(self.accelerator.process_index + 1) + ".duckdb"),
             launch_method=launch_method,
-            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".db"),
+            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.14017." + str(self.accelerator.process_index + 1) + ".db"),
             docker_uri=docker_uri
         )
         self.agent_prompt = AGENT_PROMPTS[agent_method].format(
@@ -1004,8 +1016,11 @@ class GRPOTrainer(Trainer):
 
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
+        '''prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )'''
+        prompt_inputs = self.processing_class(
+            text=prompts_text, return_tensors="pt", padding=True, add_special_tokens=False
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
@@ -1106,8 +1121,11 @@ class GRPOTrainer(Trainer):
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
                         texts = [p + c for p, c in zip(prompts, completions)]
-                    reward_inputs = reward_processing_class(
+                    '''reward_inputs = reward_processing_class(
                         text=texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+                    )'''
+                    reward_inputs = reward_processing_class(
+                        text=texts, return_tensors="pt", padding=True, add_special_tokens=False
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
@@ -1139,9 +1157,6 @@ class GRPOTrainer(Trainer):
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-        if self.accelerator.is_main_process:
-            self.accelerator.log({"rewards": torch.mean(rewards)})
-            logger.info(f"rewards:{torch.mean(rewards)}")
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1153,6 +1168,9 @@ class GRPOTrainer(Trainer):
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"rewards in Rank [{self.accelerator.process_index}]:{mean_grouped_rewards}")
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -1329,6 +1347,10 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
+        if self.accelerator.is_main_process:
+            logger.info(f"Attention Mask Shape: {completion_mask.shape}")
+            logger.info(f"Attention Mask:{completion_mask.sum()}")
+
         if self.loss_type == "grpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
         elif self.loss_type == "bnpo":
@@ -1337,6 +1359,10 @@ class GRPOTrainer(Trainer):
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"[Test]: {(per_token_loss * completion_mask).sum()}")
+            logger.info(f"[Loss]: {loss}")
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
@@ -1362,6 +1388,8 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        self._metrics[mode]["loss"].append(loss.item())
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
@@ -1398,7 +1426,7 @@ class GRPOTrainer(Trainer):
                     self.num_completions_to_print,
                 )
 
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+            '''if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                 import pandas as pd
 
                 table = {
@@ -1410,7 +1438,7 @@ class GRPOTrainer(Trainer):
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                wandb.log({"completions": wandb.Table(dataframe=df)})'''
 
     def create_model_card(
         self,
@@ -1461,7 +1489,7 @@ class GRPOTrainer(Trainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            #wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="GRPO",
             trainer_citation=citation,
