@@ -11,7 +11,8 @@ def formulate_input(
         data: Dict[str, Any],
         use_pdf_id: bool = True,
         use_reference_pdf: bool = False,
-        use_image: bool = False
+        use_image: bool = False, 
+        use_draft: bool = False
 ) -> Tuple[str, List[Dict[str, Any]]]:
     question, answer_format = f"[Question]: {data['question']}", f"[Answer Format]: {data['answer_format']}"
     pdf_context, image_messages = "", []
@@ -53,5 +54,10 @@ def formulate_input(
             image_path=data['anchor_image']
         )['content']
 
-    task_prompt = '\n'.join([question, answer_format, pdf_context]).rstrip()
+    draft_prompt = f"""Generate a high-level, step-by-step plan for me to execute. Crucially, you must write the entire plan in the second person, phrasing each step as a direct command to me. Each command should describe the high-level goal (the "what") for using a specific tool, not the implementation details. Ensure the final command in your plan is `GenerateAnswer`. [Question]: Is there any paper that utilizes masked language modeling to defend against word-level adversarial attacks? [Answer Format]: Your answer should be the title of the paper WITHOUT ANY EXPLANATION. [Conference]: acl2023 [Agent's Draft]: 1. You should first use the `ClassicRetrieve` tool to search for papers matching the core concepts: 'masked language modeling' and 'word-level adversarial attacks'. 2. Next, you should analyze the search results to identify the most promising `pdf_id` and use the `RetrieveFromDatabase` tool to get its official title from the database. 3. If you cannot find the title in the database, you will need to carefully re-examine the text snippets from your search results to infer the most likely paper title. 4. `GenerateAnswer` --- Here is the question you need to plan, combine the functions of the available tools and the analysis of the tasks to provide a planning for this question. [Question]: {data['question']} [Agent's Draft]:"""
+
+    if use_draft:
+        task_prompt = '\n'.join([question, answer_format, pdf_context, draft_prompt]).rstrip()
+    else:
+        task_prompt = '\n'.join([question, answer_format, pdf_context]).rstrip()
     return task_prompt, image_messages

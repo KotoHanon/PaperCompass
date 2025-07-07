@@ -29,6 +29,6 @@ def evaluate_airqa(pred_answer: str, gold: Dict[str, Any]) -> float:
         score = eval_func(pred_answer, **eval_kwargs)
     except Exception as e:
         score = 0.0
-        logger.error(traceback.format_exc())
-        logger.error('Error occurred during evaluation: %s', str(e))
+        #logger.error(traceback.format_exc())
+        #logger.error('Error occurred during evaluation: %s', str(e))
     return score
