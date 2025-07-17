@@ -84,11 +84,11 @@ def get_completion_mask(trainer, completion_ids):
 
     return completion_mask, is_eos
 
-def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+def adaption_layer_vllm(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     trainer.messages = []
 
     for idx, example in enumerate(inputs):
-        task_prompt, image_messages, draft_prompt = formulate_input(trainer.dataset, example, use_pdf_id=True, use_draft=True)
+        task_prompt, image_messages = formulate_input(trainer.dataset, example, use_pdf_id=True, use_draft=True)
         if trainer.accelerator.is_main_process:
             if idx == 0:
                 logger.info(f'[Task Prompt]: {task_prompt}')
@@ -105,9 +105,8 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             {'role': 'user', 'content': task_prompt}
         ])
     
-    messages_with_drafts, drafts_texts, draft_ids = draft_generation(trainer=trainer, prepare_input_function=prepare_input_function, draft_prompt=draft_prompt, messages=trainer.messages, logger=logger)
-    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=messages_with_drafts, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
-    #completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
+    messages_with_drafts, drafts_texts, draft_ids = draft_generation(trainer=trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, logger=logger)
+    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=messages_with_drafts, window_size=window_size, logger=logger)
 
     completion_mask, is_eos = get_completion_mask(trainer, completion_ids)
     draft_mask = get_completion_mask(trainer, draft_ids)[0]
@@ -128,7 +127,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
 
     return completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos
 
-def draft_generation(trainer, prepare_input_function, draft_prompt, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None):
+def draft_generation(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None):
     # generate the draft.
     prompt_texts = []
     for message in messages:
@@ -141,7 +140,7 @@ def draft_generation(trainer, prepare_input_function, draft_prompt, messages: Li
             logger.warning(f"Error in converting message: {e}")
         
     prompt_inputs = trainer.processing_class(
-        text=prompt_texts, return_tensors="pt", padding=True, add_special_tokens=False
+        text=prompt_texts, return_tensors="pt", padding=True, add_special_tokens=False, padding_side="left"
     )
     # prompt_inputs.shape -> [batch_size, emb_size]
     prompt_inputs = prepare_input_function(prompt_inputs)
@@ -151,19 +150,61 @@ def draft_generation(trainer, prepare_input_function, draft_prompt, messages: Li
         prompt_ids = prompt_ids[:, -trainer.max_prompt_length:]
         prompt_mask = prompt_mask[:, -trainer.max_prompt_length:]
 
-    with unwrap_model_for_generation(trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation) as unwrapped_model:
-        with (FSDP.summon_full_params(trainer.model_wrapped, recurse=False) if trainer.is_fsdp_enabled else nullcontext()):
-                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config)
+#################################################################################### 
+    if trainer.state.global_step != trainer._last_loaded_step:
+        trainer._move_model_to_vllm()
+        trainer._last_loaded_step = trainer.state.global_step
+
+    # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+    all_prompts_text = gather_object(prompt_texts)
+    if trainer.accelerator.is_main_process:
+        # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+        # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+        # prompt individually.
+        ordered_set_of_prompts = all_prompts_text[:: trainer.num_generations]
+        with profiling_context(trainer, "vLLM.generate"):
+            completion_ids = trainer.vllm_client.generate(
+                prompts=ordered_set_of_prompts,
+                n=trainer.num_generations,
+                temperature=trainer.temperature,
+                top_p=trainer.top_p,
+                top_k=-1 if trainer.top_k is None else trainer.top_k,
+                min_p=0.0 if trainer.min_p is None else trainer.min_p,
+                max_tokens=trainer.max_completion_length,
+                guided_decoding_regex=trainer.guided_decoding_regex,
+            )
+    else:
+        completion_ids = [None] * len(all_prompts_text)
+    # Broadcast the completions from the main process to all processes, ensuring each process receives its
+    # corresponding slice.
+    completion_ids = broadcast_object_list(completion_ids, from_process=0)
+    process_slice = slice(
+        trainer.accelerator.process_index * len(prompt_texts),
+        (trainer.accelerator.process_index + 1) * len(prompt_texts),
+    )
+    completion_ids = completion_ids[process_slice]
+
+    # Pad the completions, and concatenate them with the prompts
+    completion_ids = [torch.tensor(ids, device=trainer.accelerator.device) for ids in completion_ids]
+    draft_ids = pad(completion_ids, padding_value=trainer.processing_class.pad_token_id)
+    prompt_completion_ids = torch.cat([prompt_ids, draft_ids], dim=1)
+####################################################################################
 
     prompt_length = prompt_ids.size(1)
-    draft_ids = prompt_completion_ids[:, prompt_length:]   
+    #draft_ids = prompt_completion_ids[:, prompt_length:]   
     draft_texts = trainer.processing_class.batch_decode(draft_ids, skip_special_tokens=True)
 
     # assign each draft text to the corresponding message
     new_messages = copy.deepcopy(messages) # messages with draft texts appended
+    follow_prompt = "Crucially, you must first give a thinking process based on following step-by-step plan and then take the corresponding Action. You are limited to ONLY ONE single Action per turn."
     for idx, (message, draft_text) in enumerate(zip(messages, draft_texts)):
-        cur_content = message[-1]["content"]
-        new_content = cur_content.replace(draft_prompt, draft_text)
+        lines = message[-1]["content"].split('\n')
+        lines.pop(len(lines) - 1) # remove the draft generation prompt!
+        #original_content = '\n'.join(lines).rstrip()
+        #original_messages[idx][-1]["content"] = original_content
+        lines.append(follow_prompt)
+        lines.append(draft_text)
+        new_content = '\n'.join(lines).rstrip()
         new_messages[idx][-1]["content"] = new_content
         if trainer.accelerator.is_main_process:
             logger.info(f'[Prompt]: {new_content}')
@@ -226,12 +267,51 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 initial_prompt_ids = prompt_ids
                 initial_prompt_mask = prompt_mask
 
-        with unwrap_model_for_generation(trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation) as unwrapped_model:
-            with (FSDP.summon_full_params(trainer.model_wrapped, recurse=False) if trainer.is_fsdp_enabled else nullcontext()):
-                    prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config)
+####################################################################################        
+        # First, have main process load weights if needed
+        '''if trainer.state.global_step != trainer._last_loaded_step:
+            logger.critical(f"CRITICAL: RELOADING MODEL TO VLLM IN TURN! Global step: {trainer.state.global_step}, Last loaded step: {trainer._last_loaded_step}")
+            trainer._move_model_to_vllm()
+            trainer._last_loaded_step = trainer.state.global_step'''
+
+        # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+        all_prompts_text = gather_object(prompt_texts)
+        if trainer.accelerator.is_main_process:
+            # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+            # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+            # prompt individually.
+            ordered_set_of_prompts = all_prompts_text[:: trainer.num_generations]
+            with profiling_context(trainer, "vLLM.generate"):
+                completion_ids = trainer.vllm_client.generate(
+                    prompts=ordered_set_of_prompts,
+                    n=trainer.num_generations,
+                    temperature=trainer.temperature,
+                    top_p=trainer.top_p,
+                    top_k=-1 if trainer.top_k is None else trainer.top_k,
+                    min_p=0.0 if trainer.min_p is None else trainer.min_p,
+                    max_tokens=trainer.max_completion_length,
+                    guided_decoding_regex=trainer.guided_decoding_regex,
+                )
+        else:
+            completion_ids = [None] * len(all_prompts_text)
+        # Broadcast the completions from the main process to all processes, ensuring each process receives its
+        # corresponding slice.
+        completion_ids = broadcast_object_list(completion_ids, from_process=0)
+        process_slice = slice(
+            trainer.accelerator.process_index * len(prompt_texts),
+            (trainer.accelerator.process_index + 1) * len(prompt_texts),
+        )
+        completion_ids = completion_ids[process_slice]
+
+        # Pad the completions, and concatenate them with the prompts
+        completion_ids = [torch.tensor(ids, device=trainer.accelerator.device) for ids in completion_ids]
+        completion_ids = pad(completion_ids, padding_value=trainer.processing_class.pad_token_id)
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+####################################################################################
+
 
         prompt_length = prompt_ids.size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]   
+        #completion_ids = prompt_completion_ids[:, prompt_length:]   
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
         active_mask_copy = active_mask.copy()
@@ -308,9 +388,9 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        if len(prompt_completion_ids_list[idx]) >= 5:
-            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-5:]
-            completion_ids_list[idx] = completion_ids_list[idx][-5:]
+        if len(prompt_completion_ids_list[idx]) >= 10:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-10:]
+            completion_ids_list[idx] = completion_ids_list[idx][-10:]
         
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
 

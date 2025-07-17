@@ -49,7 +49,7 @@ from transformers.utils import is_datasets_available, is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..extras.vllm_client import VLLMClient
+#from ..extras.vllm_client import VLLMClient
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
@@ -74,9 +74,8 @@ from utils.functions.common_functions import truncate_tokens
 from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 from .training_adapter import adaption_layer
+from .training_adapter_vllm import adaption_layer_vllm 
 import logging, json, tiktoken
-
-API_KEY = "be190084a05f7ea4c7eb9ea8fab419b7ad717110"
 
 
 if is_peft_available():
@@ -85,9 +84,10 @@ if is_peft_available():
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
 
-if is_wandb_available():
-    import wandb
-    wandb.login(key=API_KEY)
+'''if is_wandb_available():
+    #import wandb
+    #wandb.login(key=API_KEY)
+    pass'''
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -367,7 +367,7 @@ class GRPOTrainer(Trainer):
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
-        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        solution_reward_funcs: Union[RewardFunc, list[RewardFunc]],
         args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -391,6 +391,7 @@ class GRPOTrainer(Trainer):
         length_limit: int = 32,
         database_dir: str = None,
         vectorstore_dir: str = None,
+        window_size: int = 5,
     ):
         # Args
         if args is None:
@@ -462,46 +463,47 @@ class GRPOTrainer(Trainer):
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            '''processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)'''
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
         
 
-        # Reward functions
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
-        self.reward_func_names = []
-        for i, reward_func in enumerate(reward_funcs):
+
+        if not isinstance(solution_reward_funcs, list):
+            solution_reward_funcs = [solution_reward_funcs]
+        self.solution_reward_func_names = []
+        for i, reward_func in enumerate(solution_reward_funcs):
             if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                solution_reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
                     reward_func, num_labels=1, **model_init_kwargs
                 )
-            if isinstance(reward_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
-                self.reward_func_names.append(reward_funcs[i].config._name_or_path.split("/")[-1])
+            if isinstance(solution_reward_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
+                self.solution_reward_func_names.append(solution_reward_funcs[i].config._name_or_path.split("/")[-1])
             else:
-                self.reward_func_names.append(reward_funcs[i].__name__)
-        self.reward_funcs = reward_funcs
+                self.solution_reward_func_names.append(solution_reward_funcs[i].__name__)
+        self.solution_reward_funcs = solution_reward_funcs
 
         # Reward weights
         if args.reward_weights is not None:
-            if len(args.reward_weights) != len(reward_funcs):
+            if len(args.reward_weights) != len(solution_reward_funcs):
                 raise ValueError(
                     f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
-                    f"functions ({len(reward_funcs)})"
+                    f"functions ({len(solution_reward_funcs)})"
                 )
-            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+            self.solution_reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
-            self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
+            self.solution_reward_weights = torch.ones(len(solution_reward_funcs), dtype=torch.float32)
 
-        # Reward processing class
+
         if reward_processing_classes is None:
-            reward_processing_classes = [None] * len(reward_funcs)
+            solution_reward_processing_classes = [None] * len(solution_reward_funcs)
         elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
+            solution_reward_processing_classes = [reward_processing_classes]
         else:
-            if len(reward_processing_classes) != len(reward_funcs):
+            if len(reward_processing_classes) != len(solution_reward_funcs):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
-        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+        for i, (reward_processing_class, reward_func) in enumerate(zip(solution_reward_processing_classes, solution_reward_funcs)):
             if isinstance(reward_func, PreTrainedModel):
                 if reward_processing_class is None:
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
@@ -510,8 +512,8 @@ class GRPOTrainer(Trainer):
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
                 # So it's important to set the pad token ID to the padding token ID of the processing class.
                 reward_func.config.pad_token_id = reward_processing_class.pad_token_id
-                reward_processing_classes[i] = reward_processing_class
-        self.reward_processing_classes = reward_processing_classes
+                solution_reward_processing_classes[i] = reward_processing_class
+        self.solution_reward_processing_classes = solution_reward_processing_classes
 
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
@@ -526,6 +528,7 @@ class GRPOTrainer(Trainer):
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
+        self.max_draft_length = args.max_draft_length 
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.temperature = args.temperature
         self.top_p = args.top_p
@@ -541,18 +544,7 @@ class GRPOTrainer(Trainer):
         self.consistency_N = 3
         self.max_turn = max_turn
         self.image_limit, self.length_limit = image_limit, length_limit
-        '''task_prompt, image_messages = formulate_input(dataset, example, use_pdf_id=True)
-        task_prompt = "\n".join([
-            task_prompt,
-            f"[Database Schema]: {self.database_prompt}",
-            f"[Vectorstore Schema]: {self.vectorstore_prompt}"
-        ])
-        if image_messages:
-            task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
-        self.messages = [
-            {'role': 'system', 'content': self.agent_prompt},
-            {'role': 'user', 'content': task_prompt}
-        ]'''
+        self.window_size = window_size
         # logger.info(f'[Agent Prompt]: {self.agent_prompt}')
 
         # Datasets
@@ -616,6 +608,17 @@ class GRPOTrainer(Trainer):
                 use_ref_model=self.ref_model is not None,
             )
 
+        '''super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )'''
+
         super().__init__(
             model=model,
             args=args,
@@ -640,8 +643,7 @@ class GRPOTrainer(Trainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
-        #self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
-        self.wandb_log_unique_prompts = True
+        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
@@ -653,9 +655,11 @@ class GRPOTrainer(Trainer):
             interact_protocol=interact_protocol,
             database=database,
             vectorstore=vectorstore,
-            database_path=os.path.join(self.database_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".duckdb"),
+            database_path=os.path.join(self.database_dir, "ai_research.14017." + str(self.accelerator.process_index + 1) + ".duckdb"),
+            #database_path=os.path.join(self.database_dir, "ai_research.14017." + ".duckdb"),
             launch_method=launch_method,
-            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.base501." + str(self.accelerator.process_index + 1) + ".db"),
+            vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.14017." + str(self.accelerator.process_index + 1) + ".db"),
+            #vectorstore_path=os.path.join(self.vectorstore_dir, "ai_research.14017." + ".db"),
             docker_uri=docker_uri
         )
         self.agent_prompt = AGENT_PROMPTS[agent_method].format(
@@ -743,6 +747,20 @@ class GRPOTrainer(Trainer):
                 cache_implementation=args.cache_implementation,
             )
 
+            self.draft_config = GenerationConfig(
+                max_new_tokens=self.max_draft_length,
+                do_sample=True,
+                pad_token_id=processing_class.pad_token_id,
+                bos_token_id=processing_class.bos_token_id,
+                eos_token_id=processing_class.eos_token_id,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                repetition_penalty=self.repetition_penalty,
+                cache_implementation=args.cache_implementation,
+            )
+
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
@@ -759,13 +777,14 @@ class GRPOTrainer(Trainer):
 
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
-
-        for i, reward_func in enumerate(self.reward_funcs):
+        
+        for i, reward_func in enumerate(self.solution_reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 if self.is_deepspeed_enabled:
-                    self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
+                    self.solution_reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
                 else:
-                    self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+                    self.solution_reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1005,6 +1024,9 @@ class GRPOTrainer(Trainer):
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
+        prompt_inputs = self.processing_class(
+            text=prompts_text, return_tensors="pt", padding=True, add_special_tokens=False
+        )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
@@ -1014,137 +1036,11 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
-            # First, have main process load weights if needed
-            if self.state.global_step != self._last_loaded_step:
-                self._move_model_to_vllm()
-                self._last_loaded_step = self.state.global_step
-
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
-                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                # prompt individually.
-                ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-                with profiling_context(self, "vLLM.generate"):
-                    completion_ids = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompts,
-                        n=self.num_generations,
-                        repetition_penalty=self.repetition_penalty,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=-1 if self.top_k is None else self.top_k,
-                        min_p=0.0 if self.min_p is None else self.min_p,
-                        max_tokens=self.max_completion_length,
-                        guided_decoding_regex=self.guided_decoding_regex,
-                    )
-            else:
-                completion_ids = [None] * len(all_prompts_text)
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its
-            # corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            completion_ids = completion_ids[process_slice]
-
-            # Pad the completions, and concatenate them with the prompts
-            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
-            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
-            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos = adaption_layer_vllm(self, inputs, window_size=self.window_size, use_consistency_selection=False, consistency_N=1, logger=logger, prepare_input_function=super()._prepare_inputs)
         else:
-            # Regular generation path
-            '''with unwrap_model_for_generation(
-                self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-            ) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                )
-            
-            # Compute prompt length and extract completion ids
-            prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]'''
-            #print(prompts_text)
+            completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos = adaption_layer(self, inputs, window_size=self.window_size, use_consistency_selection=False, consistency_N=1, logger=logger, prepare_input_function=super()._prepare_inputs)
 
-            # TODO: 需要修改，因为inputs[0]是字典，而不是example。这里只是占位用于前向debug
-            prompt_completion_idss = []
-            completion_idss = []
-
-            # 这里做个并行化处理
-            ''' self.messages = []
-            for example in inputs:
-                task_prompt, image_messages = formulate_input(self.dataset, example, use_pdf_id=True)
-                task_prompt = "\n".join([
-                    task_prompt,
-                    f"[Database Schema]: {self.database_prompt}",
-                    f"[Vectorstore Schema]: {self.vectorstore_prompt}"
-                ])
-                if image_messages:
-                    task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
-                self.messages.append(
-                    [
-                    {'role': 'system', 'content': self.agent_prompt},
-                    {'role': 'user', 'content': task_prompt}
-                ]
-                )'''
-
-            # 目前已经对interact函数进行优化，使得generate是并行的
-            # TODO: 并行化后处理
-            ''' completions_texts, prompt_completion_ids, completion_ids = self.interact(messages=self.messages, use_consistency_selection=False, consistency_N=1) # 使用GRPO的生成方法替代model.get_response'''
-            # 这里的completions_text不是Agent生成的全部内容，而是经过提取后的"答案"    
-            '''# 对prompt_completion_idss和completion_idss进行padding
-            seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in prompt_completion_idss]
-            padded_prompt_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
-            prompt_completion_ids = padded_prompt_completion_ids
-
-            seqs = [x.squeeze(0) if x.dim() == 2 and x.size(0) == 1 else x for x in completion_idss]
-            padded_completion_ids = pad_sequence(seqs, batch_first=True, padding_value=self.processing_class.pad_token_id)
-            completion_ids = padded_completion_ids'''
-        '''# 预处理：由于多步性，我是直接把多个response拼接在一起，因此有多个eos。
-        # 因此需要找到每个response的eos，并将其作为结束标志。只留下最后的eos以便后续的处理
-
-        # mask掉两个内容：1. 第一个eos之后的token； 2. 是pad的token
-        is_eos = completion_ids == self.processing_class.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        eos_position_mask = sequence_indices <= eos_idx.unsqueeze(1)
-        non_padding_mask = completion_ids != self.processing_class.pad_token_id
-        combined_mask = eos_position_mask & non_padding_mask
-        completion_mask = combined_mask.int()
-
-        if self.mask_truncated_completions:
-            truncated_completions = ~is_eos.any(dim=1)
-            completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
-
-        # 创建用于模型前向传播的 attention_mask
-        # 修改：拼接 prompt_mask 和 completion_mask 的副本，并处理两者长度与prompt_completion_ids 一致
-        attention_prompt_mask = prompt_mask
-        attention_completion_mask = completion_mask.clone()
-
-        # 调整 prompt_mask 和 completion_mask 以适应 prompt_completion_ids 的长度
-        prompt_completion_len = prompt_completion_ids.size(1)
-        prompt_len = prompt_ids.size(1)
-        completion_len = completion_ids.size(1)
-
-        if prompt_len + completion_len != prompt_completion_len:
-            # 如果长度不一致，可能需要填充或截断
-            if prompt_len + completion_len < prompt_completion_len:
-                # 需要填充
-                pad_len = prompt_completion_len - (prompt_len + completion_len)
-                attention_completion_mask = torch.nn.functional.pad(attention_completion_mask, (0, pad_len), value=0)
-            else:
-                # 需要截断
-                attention_completion_mask = attention_completion_mask[:, :(prompt_completion_len-prompt_len)]
-
-        # 拼接 attention_mask
-        attention_mask = torch.cat([attention_prompt_mask, attention_completion_mask], dim=1)'''
-        
-        completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos = adaption_layer(self, inputs, prompt_ids, prompt_mask, use_consistency_selection=False, consistency_N=1, logger=logger, prepare_input_function=super()._prepare_inputs)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         with torch.no_grad():
@@ -1176,15 +1072,15 @@ class GRPOTrainer(Trainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_texts
+    
+        solution_rewards_per_func = torch.zeros(len(prompts), len(self.solution_reward_funcs), device=device)
         
-
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+        for i, (solution_reward_func, reward_processing_class, reward_func_name) in enumerate(
+            zip(self.solution_reward_funcs, self.solution_reward_processing_classes, self.solution_reward_func_names)
         ):
             with profiling_context(self, reward_func_name):
                 if isinstance(
-                    reward_func, nn.Module
+                    solution_reward_func, nn.Module
                 ):  # Module instead of PretrainedModel for compat with compiled models
                     if is_conversational(inputs[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
@@ -1192,24 +1088,24 @@ class GRPOTrainer(Trainer):
                     else:
                         texts = [p + c for p, c in zip(prompts, completions)]
                     reward_inputs = reward_processing_class(
-                        text=texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+                        text=texts, return_tensors="pt", padding=True, add_special_tokens=False
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                        solution_rewards_per_func[:, i] = solution_reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                    output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                    output_reward_func = solution_reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
-                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    solution_rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+            
 
         # If all reward functions return None for a given row, issue a detailed warning
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+        if torch.isnan(solution_rewards_per_func).all(dim=1).any():
+            nan_row_idx = torch.isnan(solution_rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
             row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
             row_reward_kwargs["prompt"] = prompts[nan_row_idx]
             row_reward_kwargs["completion"] = completions[nan_row_idx]
@@ -1218,33 +1114,55 @@ class GRPOTrainer(Trainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        solution_rewards_per_func = gather(solution_rewards_per_func)
 
         # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
-        if self.accelerator.is_main_process:
-            self.accelerator.log({"rewards": torch.mean(rewards)})
-            logger.info(f"rewards:{torch.mean(rewards)}")
+        #draft_rewards = (draft_rewards_per_func * self.draft_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        solution_rewards = (solution_rewards_per_func * self.solution_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+
+        logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the draft tokens and completion tokens
+        per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
+        draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
+    
+        traj_ent = draft_per_token_logps.mean(dim=-1)
+
+        binary_rewards = (solution_rewards > 0).float()
+        draft_rewards = binary_rewards * traj_ent
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        draft_mean_grouped_rewards = draft_rewards.view(-1, self.num_generations).mean(dim=1)
+        draft_std_grouped_rewards = draft_rewards.view(-1, self.num_generations).std(dim=1)
 
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
+        solution_mean_grouped_rewards = solution_rewards.view(-1, self.num_generations).mean(dim=1)
+        solution_std_grouped_rewards = solution_rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the draft rewards to compute the advantages
+        draft_mean_grouped_rewards = draft_mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        draft_std_grouped_rewards = draft_std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        draft_advantages = draft_rewards - draft_mean_grouped_rewards
         if self.scale_rewards:
-            advantages = advantages / (std_grouped_rewards + 1e-4)
+            draft_advantages = draft_advantages / (draft_std_grouped_rewards + 1e-4)
+
+        # Normalize the solution rewards to compute the advantages
+        solution_mean_grouped_rewards = solution_mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        solution_std_grouped_rewards = solution_std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        solution_advantages = solution_rewards - solution_mean_grouped_rewards
+        if self.scale_rewards:
+            solution_advantages = solution_advantages / (solution_std_grouped_rewards + 1e-4)
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"draft advantages in Rank [{self.accelerator.process_index}]:{draft_advantages}")
+            logger.info(f"draft rewards in Rank [{self.accelerator.process_index}]:{draft_mean_grouped_rewards}")
+            logger.info(f"solution advantages in Rank [{self.accelerator.process_index}]:{solution_advantages}")
+            logger.info(f"solution rewards in Rank [{self.accelerator.process_index}]:{solution_mean_grouped_rewards}")
 
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        advantages = advantages[process_slice]
+        draft_advantages = draft_advantages[process_slice]
+        solution_advantages = solution_advantages[process_slice]
 
         # Log the metrics
         if mode == "train":
@@ -1270,349 +1188,34 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_mask.float().max().item())
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
-        for i, reward_func_name in enumerate(self.reward_func_names):
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_rewards = nanstd(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        for i, reward_func_name in enumerate(self.solution_reward_func_names):
+            mean_rewards = torch.nanmean(solution_rewards_per_func[:, i]).item()
+            self._metrics[mode][f"solution_rewards/{reward_func_name}/mean"].append(mean_rewards)
+            std_rewards = nanstd(solution_rewards_per_func[:, i]).item()
+            self._metrics[mode][f"solution_rewards/{reward_func_name}/std"].append(std_rewards)
+        self._metrics[mode]["solution_reward"].append(solution_mean_grouped_rewards.mean().item())
+        self._metrics[mode]["solution_reward_std"].append(solution_std_grouped_rewards.mean().item())
 
         # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompts_text))
         self._textual_logs["completion"].extend(gather_object(completions_texts))
-        for i, name in enumerate(self.reward_func_names):
-            self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+        for i, name in enumerate(self.solution_reward_func_names):
+            self._textual_logs["rewards"][name].extend(solution_rewards_per_func[:, i].tolist())
 
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "advantages": advantages,
+            "draft_ids": draft_ids,
+            "draft_mask": draft_mask,
+            "draft_advantages": draft_advantages,
+            "solution_advantages": solution_advantages,
+            "solution_rewards": solution_rewards,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
+            "per_token_logps": per_token_logps,
         }
-    
-    def get_most_consistent_action(self, candidate_actions: List[Dict[str, Any]]) -> Tuple[Action, int]:
-        if len(candidate_actions) == 1:
-            return candidate_actions[0]["action"], candidate_actions[0]["idx"]
-        
-        action_types = [item["action"].action_type for item in candidate_actions]
-        type_counter = collections.Counter(action_types)
-        most_common_type, _ = type_counter.most_common(1)[0]
-
-        actions_of_most_common_type = [item for item in candidate_actions if item["action"].action_type == most_common_type]
-
-        if len(actions_of_most_common_type) == 1:
-            return actions_of_most_common_type[0]["action"], actions_of_most_common_type[0]["idx"]
-
-        param_combinations = []
-        action_by_params = {}
-        for item in actions_of_most_common_type:
-            action = item["action"]
-            idx = item["idx"]
-            params = {}
-            if action.action_type == "RetrieveFromDatabase":
-                params["sql"] = action.parameters["sql"]
-            elif action.action_type == "RetrieveFromVectorstore":
-                params["query"] = action.parameters["query"]
-                params["collection_name"] = action.parameters["collection_name"]
-                params["table_name"] = action.parameters["table_name"]
-                params["column_name"] = action.parameters["column_name"]
-                params["filter"] = action.parameters["filter"]  
-                params["limit"] = action.parameters["limit"]
-            elif action.action_type == "CalculateExpr":
-                params["expr"] = action.parameters["expr"]
-            elif action.action_type == "ViewImage":
-                params["paper_id"] = action.parameters["paper_id"]
-                params["page_number"] = action.parameters["page_number"]
-                params["bounding_box"] = action.parameters["bounding_box"]
-            elif action.action_type == "GenerateAnswer":
-                params["answer"] = action.parameters["answer"]
-            param_str = json.dumps(params, sort_keys=True)
-            param_combinations.append(param_str)
-
-            if param_str not in action_by_params:
-                action_by_params[param_str] = (action, idx)
-        
-        param_counter = collections.Counter(param_combinations)
-        most_common_param, _ = param_counter.most_common(1)[0]
-
-        return action_by_params[most_common_param]
-    
-    def interact(self, messages: List[List[Dict[str, Any]]], window_size: int = 3, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5) -> str:
-        # prev_cost = self.model.get_cost()
-        self.env.reset()
-        true_prompt_completion_ids = []
-        true_completion_ids = []
-
-        batch_size = len(messages)
-        active_mask = [True] * batch_size # 用于记录每个样本是否已经完成任务
-        obss = [[] for _ in range(batch_size)] # 理论上是[batch_size, num_turn]
-
-        for turn in range(self.max_turn):
-            if not any(active_mask):
-                logger.info(f'[Info]: all samples have completed the task at turn {turn + 1}.')
-                break
-            
-            logger.info(f'[Interaction Turn]: {turn + 1}')
-            prompt_texts = [] # 需要批量处理的prompt
-            for message in messages:
-                if len(message) > (window_size + 1) * 2: # each turn has two messages from assistant and user, respectively
-                    current_message = message[:2] + message[-window_size * 2:]
-                else: current_message = message
-
-                message = self.convert_message_from_gpt_format(messages=current_message)
-                prompt_texts.append(maybe_apply_chat_template({"prompt": message}, self.processing_class)["prompt"])
-
-            prompt_inputs = self.processing_class(
-                text=prompt_texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-            )
-            # 此时prompt_inputs是[batch_size, emb_size]
-            prompt_inputs = super()._prepare_inputs(prompt_inputs)
-            prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(self.accelerator.device), prompt_inputs["attention_mask"].to(self.accelerator.device)
-            
-            if self.max_prompt_length is not None:
-                prompt_ids = prompt_ids[:, -self.max_prompt_length:]
-                prompt_mask = prompt_mask[:, -self.max_prompt_length:]
-            
-            iter = 1 if use_consistency_selection else consistency_N
-            responsess = []
-            prompt_completion_idss = []
-            completion_idss = []
-            '''for _ in range(iter):
-                # 使用GRPO的生成方法替代model.get_response
-                # 参考Agent框架里面的convert_message_from_gpt_format，做出裁剪。
-                with unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model:
-                    prompt_completion_ids = unwrapped_model.generate(
-                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                    )
-                    prompt_completion_idss.append(prompt_completion_ids)
-
-                prompt_length = prompt_ids.size(1)
-                completion_ids = prompt_completion_ids[:, prompt_length:]
-                
-                completion_idss.append(completion_ids)
-                completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
-                
-                # 因为step是串行交互的，因此这里通过for循环转串行
-                responses = completion_texts
-                for response in responses:
-                    obs, _, flag, _ = self.env.step(response, **output_kwargs)
-                    obss.append(obs)
-                    flags.append(flag)'''
-
-            with unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model:
-                    prompt_completion_ids = unwrapped_model.generate(
-                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                    )
-                    '''prompt_completion_idss.append(prompt_completion_ids)'''
-
-            prompt_length = prompt_ids.size(1)
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-            
-            '''completion_idss.append(completion_ids)'''
-            completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-            
-            # 因为step是串行交互的，因此这里通过for循环转串行
-            for idx in range(batch_size):
-                if active_mask[idx]:
-                    response = completion_texts[idx]
-                    obs, _, flag, _ = self.env.step(response, **output_kwargs)
-                    obss[idx].append(obs) # [batch_size, num_turn]
-                    if flag:
-                        active_mask[idx] = False # 对应的样本已经完成任务
-                else:
-                    obss[idx].append(None)
-                    # 把completion_ids[idx]中的每一个元素替换为pad_token_id。因为对已经交互结束的样本，我们不应该继续计算它的loss。
-                    completion_ids[idx] = torch.full_like(completion_ids[idx], self.processing_class.pad_token_id)
-                    prompt_completion_ids[idx][:, prompt_length:] = completion_ids[idx]
-
-            '''responsess.append(responses)'''
-            '''candidate_actions : List[Dict[int, Action]] = [{
-                "idx": i,
-                "action": self.env.parsed_actions[-i:]
-            } for i in range(iter)]'''
-            # clean the last iter_num actions, and only keep the most consistent action
-            # TODO: 需要解决self.get_most_consistent_action(candidate_actions)[0]返回的是一个元组，而不是一个Action的问题
-            actions: List[Action] = self.env.parsed_actions[-batch_size:] # 一共有batch_size个action，按response的顺序依次添加
-            '''self.env.parsed_actions = self.env.parsed_actions[:-iter]
-            self.env.parsed_actions.append(action)'''
-            # get the response of the most consistent action by index
-            '''responses = responsess[self.get_most_consistent_action(candidate_actions)[1]]
-            true_prompt_completion_ids.append(prompt_completion_idss[self.get_most_consistent_action(candidate_actions)[1]])
-            true_completion_ids.append(completion_idss[self.get_most_consistent_action(candidate_actions)[1]])'''
-    
-            true_prompt_completion_ids.append(prompt_completion_ids) # true_prompt_completion_ids是num_turn个[batch_size, seq_len]的张量
-            true_completion_ids.append(completion_ids) # true_completion_ids是num_turn个[batch_size, seq_len]的张量
-
-
-            logger.info(f'[Response]: {completion_texts[0]}')
-
-            action_msgs = []
-            obs_msgs = []
-            
-            # 把action和obs转换成message
-            for action in actions:
-                if action is None:
-                    action_msgs.append(None)
-                else:
-                    action_msgs.append(action.convert_to_message(self.env.action_format, self.env.interact_protocol))
-            
-            for idx in range(batch_size):
-                if obss[idx][-1] is not None: # 若obss[idx][-1]为None，则说明样本在第turn轮已经完成任务
-                    obs_msgs.append(obss[idx][-1].convert_to_message())
-                else:
-                    obs_msgs.append(None) # 相当于padding
-        
-                #logger.info(action_msg['content'])
-
-            '''if isinstance(obs_msg['content'], list): # array of messages, see doc: https://platform.openai.com/docs/guides/vision#uploading-base64-encoded-images
-                for obs_msg_content_item in obs_msg['content']:
-                    if obs_msg_content_item['type'] == 'text':
-                        #logger.info(obs_msg_content_item['text'])
-                        pass
-            else:
-                logger.info(obs_msg['content'])'''
-
-            # update history messages
-
-            # 分发给batch中的每个Q
-            for idx, (action_msg, obs_msg) in enumerate(zip(action_msgs, obs_msgs)):
-                messages[idx].append(action_msg)
-                messages[idx].append(obs_msg)
-            if flag: # whether task is completed
-                logger.info(f'[Info]: early stop at interaction turn {turn + 1}.')
-                break
-        
-        if output_path is not None:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for m in messages:
-                    f.write(json.dumps(m, ensure_ascii=False) + '\n')
-
-        # 对obss进行处理，把最后的非None值保留作为这个response的prev_answer.
-        real_obss = [] # [batch_size, 1]
-        for idx_1 in range(batch_size):
-            for idx_2 in reversed(range(len(obss[idx_1]))):
-                if obss[idx_1][idx_2] is not None:
-                    real_obss.append(obss[idx_1][idx_2])
-                    break
-        
-        if true_prompt_completion_ids is not None:
-            # 如果列表非空，将所有张量拼接为一个[batch_size, turn_num * seq_len]的张量
-            first_dim_flattened_prompt_completion_ids = torch.cat(true_prompt_completion_ids, dim=1)
-            first_dim_flattened_completion_ids = torch.cat(true_completion_ids, dim=1)
-        else:
-            # 如果列表为空，创建空张量
-            first_dim_flattened_prompt_completion_ids = torch.tensor([], device=self.accelerator.device)
-            first_dim_flattened_completion_ids = torch.tensor([], device=self.accelerator.device)
-            
-        # 处理flattened张量中的EOS标记，只保留最后一个
-        def replace_all_but_last_eos(tensor, eos_token_id, pad_token_id):
-            """只保留张量中最后一个EOS标记，其他EOS标记替换为PAD标记"""
-            if tensor.dim() == 2 and tensor.size(0) == batch_size:  # 确保是[batch_size, seq_len]形状
-                # 对批次中的每个样本进行处理
-                for batch_idx in range(batch_size):
-                    # 找出当前样本中所有EOS标记的位置
-                    eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
-                    if len(eos_positions) > 1:  # 如果有多个EOS标记
-                        # 仅保留最后一个EOS标记，其他的替换为PAD标记
-                        for pos in eos_positions[:-1]:
-                            tensor[batch_idx, pos] = pad_token_id
-            return tensor
-        
-        # 应用EOS替换函数
-        if first_dim_flattened_prompt_completion_ids.numel() > 0:
-            first_dim_flattened_prompt_completion_ids = replace_all_but_last_eos(
-                first_dim_flattened_prompt_completion_ids, 
-                self.processing_class.eos_token_id, 
-                self.processing_class.pad_token_id
-            )
-        
-        if first_dim_flattened_completion_ids.numel() > 0:
-            first_dim_flattened_completion_ids = replace_all_but_last_eos(
-                first_dim_flattened_completion_ids, 
-                self.processing_class.eos_token_id, 
-                self.processing_class.pad_token_id
-            )
-
-        if self.accelerator.is_main_process:
-            print(first_dim_flattened_completion_ids.shape)
-            print(first_dim_flattened_prompt_completion_ids.shape)
-            
-        return [truncate_tokens(" ".join(str(obs.obs_content) for obs in real_obss))], first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids # 需要注意padding
-
-    def crop_image_count_in_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        image_limit: int = 10,
-        keep_msg: int = 2,
-        in_place: bool = False
-    ) -> List[Dict[str, Any]]:
-        """ Crop the image count in the messages.
-        @param
-            messages: the messages to be cropped.
-            image_limit: the maximum number of images to be kept.
-            keep_msg: the number of preceding messages to keep the images.
-            in_place: whether to modify the messages in place.
-        @return
-            the cropped messages.
-        """
-        image_count = 0
-        if not in_place: messages = copy.deepcopy(messages)
-
-        # images in the first two messages are maintained in the original order (usually system/task prompt)
-        for i in range(min(keep_msg, len(messages))):
-            if isinstance(messages[i]['content'], list):
-                for msg in messages[i]['content']:
-                    if msg['type'] == 'image_url':
-                        image_count += 1
-                        if image_count > image_limit:
-                            msg['type'] = 'text'
-                            if 'image_url' in msg: del msg['image_url']
-                            msg['text'] = f'The image stream is omitted due to the incapability of handling >{image_limit} images.'
-
-        # images in the rest messages are preserved in the reverse order
-        for msg in reversed(messages[keep_msg:]):
-            if isinstance(msg['content'], list):
-                for msg_dict in msg['content'][::-1]:
-                    if msg_dict['type'] == 'image_url':
-                        image_count += 1
-                        if image_count > image_limit:
-                            msg_dict['type'] = 'text'
-                            if 'image_url' in msg_dict: del msg_dict['image_url']
-                            msg_dict['text'] = f'The image stream is omitted due to the incapability of handling >{image_limit} images.'
-        return messages
-
-    def convert_message_from_gpt_format(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """ For VLLM-deployed open-source models, there are some limitations on:
-        1. the input prompt length (e.g., 32k tokens)
-        2. the number of images in the prompt (e.g., only one image)
-        """
-        keep_msg = 2 # one system message and one task message
-        messages = self.crop_image_count_in_messages(messages=messages, image_limit=self.image_limit, keep_msg=keep_msg, in_place=True)
-
-        if len(messages) > keep_msg:
-            message_max_tokens = min(self.length_limit * 1000, self.processing_class.model_max_length) # by default, qwen2.5-72b-instruct is 32k
-
-            truncated_messages = messages[:keep_msg]
-            current_tokens = sum(len(self.processing_class.encode(str(message))) for message in truncated_messages)
-            for i in range(len(messages) - 1, keep_msg - 1, -2):
-                pair = messages[i-1:i+1]
-                pair_tokens = sum(len(self.processing_class.encode(str(message))) for message in pair)
-                if current_tokens + pair_tokens > message_max_tokens:
-                    break
-                truncated_messages.insert(keep_msg, pair[1])
-                truncated_messages.insert(keep_msg, pair[0])
-                current_tokens += pair_tokens
-            messages = truncated_messages
-
-        return messages
     
     def compute_liger_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
@@ -1661,40 +1264,43 @@ class GRPOTrainer(Trainer):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        draft_ids, draft_mask = inputs["draft_ids"], inputs["draft_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
-
-        # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
+        per_token_logps = inputs["per_token_logps"]
+        draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
+        solution_per_token_logps = per_token_logps[:, draft_ids.size(1):]
+        old_per_token_logps = (
+            per_token_logps.detach() if inputs["old_per_token_logps"] is None else inputs["old_per_token_logps"]
+        )
+        old_draft_per_token_logps = old_per_token_logps[:, :draft_ids.size(1)]
+        old_solution_per_token_logps = old_per_token_logps[:, draft_ids.size(1):]
 
         # Compute the loss
-        advantages = inputs["advantages"]
+        draft_advantages = inputs["draft_advantages"]
+        solution_advantages = inputs["solution_advantages"]
+
+        # negative sample gradient masking
+        wrong_solution_idx = inputs["solution_rewards"] <= 0
+        draft_advantages[wrong_solution_idx] = solution_advantages[wrong_solution_idx]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
-        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
-        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
+        
+        draft_coef_1 = torch.exp(draft_per_token_logps - old_draft_per_token_logps)
+        draft_coef_2 = torch.clamp(draft_coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+        draft_per_token_loss1 = draft_coef_1 * draft_advantages.unsqueeze(1)
+        draft_per_token_loss2 = draft_coef_2 * draft_advantages.unsqueeze(1)
+        draft_per_token_loss = -torch.min(draft_per_token_loss1, draft_per_token_loss2)
 
-        if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
+        solution_coef_1 = torch.exp(solution_per_token_logps - old_solution_per_token_logps)
+        solution_coef_2 = torch.clamp(solution_coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+        solution_per_token_loss1 = solution_coef_1 * solution_advantages.unsqueeze(1)
+        solution_per_token_loss2 = solution_coef_2 * solution_advantages.unsqueeze(1)
+        solution_per_token_loss = -torch.min(solution_per_token_loss1, solution_per_token_loss2)
+        
+        loss = (((draft_per_token_loss * draft_mask).sum(-1)) + ((solution_per_token_loss * completion_mask).sum(-1))) / (torch.cat([draft_mask,completion_mask],dim=1).sum().clamp(min=1.0))
+
+        #loss = ((solution_per_token_loss * completion_mask).sum(-1)) / (completion_mask.sum(-1).clamp(min=1.0).mean())
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
@@ -1704,22 +1310,8 @@ class GRPOTrainer(Trainer):
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).nanmean().item())
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
+        self._metrics[mode]["loss"].append(loss.item())
 
-        low_clip = (is_low_clipped * completion_mask).sum() / completion_mask.sum()
-        high_clip = (is_high_clipped * completion_mask).sum() / completion_mask.sum()
-        clip_ratio = (is_region_clipped * completion_mask).sum() / completion_mask.sum()
-
-        gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather_for_metrics(high_clip)
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
@@ -1756,7 +1348,7 @@ class GRPOTrainer(Trainer):
                     self.num_completions_to_print,
                 )
 
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+            '''if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                 import pandas as pd
 
                 table = {
@@ -1768,7 +1360,7 @@ class GRPOTrainer(Trainer):
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                wandb.log({"completions": wandb.Table(dataframe=df)})'''
 
     def create_model_card(
         self,
@@ -1819,7 +1411,7 @@ class GRPOTrainer(Trainer):
             hub_model_id=self.hub_model_id,
             dataset_name=dataset_name,
             tags=tags,
-            wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
+            #wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="GRPO",
             trainer_citation=citation,

@@ -215,6 +215,10 @@ class GRPOConfig(TrainingArguments):
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
     )
+    max_draft_length: Optional[int] = field(
+        default=256,
+        metadata={"help": "Maximum length of the generated draft."},
+    )
     ds3_gather_for_generation: bool = field(
         default=True,
         metadata={
