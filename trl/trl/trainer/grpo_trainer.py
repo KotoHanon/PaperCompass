@@ -61,6 +61,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     selective_log_softmax,
+    entropy_from_logits
 )
 
 from agents.envs import infer_env_class, AgentEnv
@@ -912,28 +913,39 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
+    def _get_per_token_logps_and_entropies(
+        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, compute_entropy=False
+    ) -> dict[str, Optional[torch.Tensor]]:
+        """Compute log‐probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
-        for i in range(0, input_ids.size(0), batch_size):
-            input_ids_batch = input_ids[i : i + batch_size]
-            attention_mask_batch = attention_mask[i : i + batch_size]
+        all_entropies = []
+        for start in range(0, input_ids.size(0), batch_size):
+            input_ids_batch = input_ids[start : start + batch_size]
+            attention_mask_batch = attention_mask[start : start + batch_size]
 
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
-                input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
+                input_ids=input_ids_batch,
+                attention_mask=attention_mask_batch,
+                logits_to_keep=logits_to_keep + 1,
             ).logits
             logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-            input_ids_batch = input_ids_batch[:, -logits_to_keep:]
-            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
-            # See https://github.com/huggingface/trl/issues/2770
-            logits = logits[:, -logits_to_keep:]
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
-            logps = selective_log_softmax(logits, input_ids_batch)  # compute logprobs for the input tokens
+
+            completion_ids = input_ids_batch[:, -logits_to_keep:]
+            logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
             all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
+
+            if compute_entropy:
+                entropies = entropy_from_logits(logits)
+                all_entropies.append(entropies)
+
+        logps = torch.cat(all_logps, dim=0)
+        entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        return logps, entropies
 
     @profiling_decorator
     def _move_model_to_vllm(self):
@@ -1043,12 +1055,14 @@ class GRPOTrainer(Trainer):
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
+        truncate_pc_ids = prompt_completion_ids[:,-(1000 + draft_ids.size(1) + completion_ids.size(1)):]
+
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
                 )
             else:
                 old_per_token_logps = None
@@ -1056,13 +1070,13 @@ class GRPOTrainer(Trainer):
             if self.beta == 0.0:
                 ref_per_token_logps = None
             elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.ref_model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
                     )
 
         if is_conversational(inputs[0]):
@@ -1120,14 +1134,19 @@ class GRPOTrainer(Trainer):
         #draft_rewards = (draft_rewards_per_func * self.draft_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
         solution_rewards = (solution_rewards_per_func * self.solution_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
+        # TODO : 3B or 7B
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the draft tokens and completion tokens
-        per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
+        #per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=True)
+        #logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, truncate_pc_ids, attention_mask, logits_to_keep, compute_entropy=True)
+
         draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
     
         traj_ent = draft_per_token_logps.mean(dim=-1)
 
         binary_rewards = (solution_rewards > 0).float()
-        draft_rewards = binary_rewards * traj_ent
+        #draft_rewards = binary_rewards * traj_ent
+        draft_rewards = solution_rewards.copy()
 
         # Compute grouped-wise rewards
         draft_mean_grouped_rewards = draft_rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1151,8 +1170,8 @@ class GRPOTrainer(Trainer):
             solution_advantages = solution_advantages / (solution_std_grouped_rewards + 1e-4)
         
         if self.accelerator.is_main_process:
-            logger.info(f"draft advantages in Rank [{self.accelerator.process_index}]:{draft_advantages}")
-            logger.info(f"draft rewards in Rank [{self.accelerator.process_index}]:{draft_mean_grouped_rewards}")
+            #logger.info(f"draft advantages in Rank [{self.accelerator.process_index}]:{draft_advantages}")
+            #logger.info(f"draft rewards in Rank [{self.accelerator.process_index}]:{draft_mean_grouped_rewards}")
             logger.info(f"solution advantages in Rank [{self.accelerator.process_index}]:{solution_advantages}")
             logger.info(f"solution rewards in Rank [{self.accelerator.process_index}]:{solution_mean_grouped_rewards}")
 
@@ -1161,7 +1180,7 @@ class GRPOTrainer(Trainer):
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        draft_advantages = draft_advantages[process_slice]
+        #draft_advantages = draft_advantages[process_slice]
         solution_advantages = solution_advantages[process_slice]
 
         # Log the metrics
@@ -1215,6 +1234,7 @@ class GRPOTrainer(Trainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "per_token_logps": per_token_logps,
+            "entropies": entropies,
         }
     
     def compute_liger_loss(self, model, inputs):
@@ -1262,6 +1282,8 @@ class GRPOTrainer(Trainer):
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
+
+        #TODO: 3B or 7B
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         draft_ids, draft_mask = inputs["draft_ids"], inputs["draft_mask"]
@@ -1270,19 +1292,33 @@ class GRPOTrainer(Trainer):
         per_token_logps = inputs["per_token_logps"]
         draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
         solution_per_token_logps = per_token_logps[:, draft_ids.size(1):]
+        entropies = inputs["entropies"][:, -(draft_ids.size(1) + completion_ids.size(1)):]
+        #entropies = inputs["entropies"]
+        if self.accelerator.is_main_process:
+            logger.info(f"entropies shape: {entropies.shape}")
+        draft_entropies = entropies[:, :draft_ids.size(1)]
+        solution_entropies = entropies[:, draft_ids.size(1):]
+
         old_per_token_logps = (
             per_token_logps.detach() if inputs["old_per_token_logps"] is None else inputs["old_per_token_logps"]
         )
         old_draft_per_token_logps = old_per_token_logps[:, :draft_ids.size(1)]
         old_solution_per_token_logps = old_per_token_logps[:, draft_ids.size(1):]
 
+        # get the entropy
+        draft_entropy = (draft_entropies * draft_mask).sum(dim=-1) / draft_mask.sum(dim=-1).clamp(min=1.0)
+        solution_entropy = (solution_entropies * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp(min=1.0)
+        if self.accelerator.is_main_process:
+            logger.info(f"draft entropy in Rank [{self.accelerator.process_index}]:{draft_entropy.item()}")
+            logger.info(f"solution entropy in Rank [{self.accelerator.process_index}]:{solution_entropy.item()}")
+
         # Compute the loss
         draft_advantages = inputs["draft_advantages"]
         solution_advantages = inputs["solution_advantages"]
 
         # negative sample gradient masking
-        wrong_solution_idx = inputs["solution_rewards"] <= 0
-        draft_advantages[wrong_solution_idx] = solution_advantages[wrong_solution_idx]
+        #wrong_solution_idx = inputs["solution_rewards"] <= 0
+        #draft_advantages[wrong_solution_idx] = solution_advantages[wrong_solution_idx]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
         
@@ -1309,7 +1345,8 @@ class GRPOTrainer(Trainer):
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).nanmean().item())
 
-        # Compute the clipped probability ratios
+        self._metrics[mode]["draft_entropy"].append(draft_entropy.item())
+        self._metrics[mode]["solution_entropy"].append(solution_entropy.item())
         self._metrics[mode]["loss"].append(loss.item())
 
         return loss
