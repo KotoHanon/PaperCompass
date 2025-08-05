@@ -38,7 +38,6 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
-from .grpo_config import GRPOConfig
 from .utils import (
     disable_dropout_in_model,
     generate_model_card,
@@ -88,7 +87,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
     trainer.messages = []
 
     for idx, example in enumerate(inputs):
-        task_prompt, image_messages = formulate_input(trainer.dataset, example, use_pdf_id=True, use_draft=True)
+        task_prompt, image_messages, draft_prompt = formulate_input(trainer.dataset, example, use_pdf_id=True, use_draft=True)
         if trainer.accelerator.is_main_process:
             if idx == 0:
                 logger.info(f'[Task Prompt]: {task_prompt}')
@@ -105,8 +104,9 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             {'role': 'user', 'content': task_prompt}
         ])
     
-    messages_with_drafts, drafts_texts, draft_ids = draft_generation(trainer=trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, logger=logger)
+    messages_with_drafts, drafts_texts, draft_ids = draft_generation(trainer=trainer, prepare_input_function=prepare_input_function, draft_prompt=draft_prompt, messages=trainer.messages, logger=logger)
     completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=messages_with_drafts, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
+    #completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
 
     completion_mask, is_eos = get_completion_mask(trainer, completion_ids)
     draft_mask = get_completion_mask(trainer, draft_ids)[0]
@@ -127,7 +127,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
 
     return completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos
 
-def draft_generation(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None):
+def draft_generation(trainer, prepare_input_function, draft_prompt, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None):
     # generate the draft.
     prompt_texts = []
     for message in messages:
@@ -152,7 +152,7 @@ def draft_generation(trainer, prepare_input_function, messages: List[List[Dict[s
 
     with unwrap_model_for_generation(trainer.model_wrapped, trainer.accelerator, gather_deepspeed3_params=trainer.args.ds3_gather_for_generation) as unwrapped_model:
         with (FSDP.summon_full_params(trainer.model_wrapped, recurse=False) if trainer.is_fsdp_enabled else nullcontext()):
-                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.generation_config)
+                prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.draft_config)
 
     prompt_length = prompt_ids.size(1)
     draft_ids = prompt_completion_ids[:, prompt_length:]   
@@ -160,15 +160,9 @@ def draft_generation(trainer, prepare_input_function, messages: List[List[Dict[s
 
     # assign each draft text to the corresponding message
     new_messages = copy.deepcopy(messages) # messages with draft texts appended
-    follow_prompt = "Crucially, you must first give a thinking process based on following step-by-step plan and then take the corresponding Action. You are limited to ONLY ONE single Action per turn."
     for idx, (message, draft_text) in enumerate(zip(messages, draft_texts)):
-        lines = message[-1]["content"].split('\n')
-        lines.pop(len(lines) - 1) # remove the draft generation prompt!
-        #original_content = '\n'.join(lines).rstrip()
-        #original_messages[idx][-1]["content"] = original_content
-        lines.append(follow_prompt)
-        lines.append(draft_text)
-        new_content = '\n'.join(lines).rstrip()
+        cur_content = message[-1]["content"]
+        new_content = cur_content.replace(draft_prompt, draft_text)
         new_messages[idx][-1]["content"] = new_content
         if trainer.accelerator.is_main_process:
             logger.info(f'[Prompt]: {new_content}')
@@ -313,9 +307,9 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        if len(prompt_completion_ids_list[idx]) >= 10:
-            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-10:]
-            completion_ids_list[idx] = completion_ids_list[idx][-10:]
+        if len(prompt_completion_ids_list[idx]) >= 5:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-5:]
+            completion_ids_list[idx] = completion_ids_list[idx][-5:]
         
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
 
@@ -325,8 +319,8 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     #first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
     #first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
         
-    first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id)
-    first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id)
+    first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
+    first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
     # only keep the last EOS token in each sample, replace others with PAD token
     
     if first_dim_flattened_prompt_completion_ids.numel() > 0:

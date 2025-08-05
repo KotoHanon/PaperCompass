@@ -79,6 +79,12 @@ _import_structure = {
     ],
     "xpo_config": ["XPOConfig"],
     "xpo_trainer": ["XPOTrainer"],
+    "mgrpo_config": ["MGRPOConfig"],
+    "mgrpo_trainer": ["MGRPOTrainer"],
+    "dapo_config": ["DAPOConfig"],
+    "dapo_trainer": ["DAPOTrainer"],
+    "dfpo_config": ["DFPOConfig"],
+    "dfpo_trainer": ["DFPOTrainer"],
 }
 try:
     if not is_diffusers_available():
@@ -150,6 +156,12 @@ if TYPE_CHECKING:
     )
     from .xpo_config import XPOConfig
     from .xpo_trainer import XPOTrainer
+    from .mgrpo_config import MGRPOConfig
+    from .mgrpo_trainer import MGRPOTrainer
+    from .dapo_config import DAPOConfig
+    from .dapo_trainer import DAPOTrainer
+    from .dfpo_config import DFPOConfig
+    from .dfpo_trainer import DFPOTrainer
 
     try:
         if not is_diffusers_available():
