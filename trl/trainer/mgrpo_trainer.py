@@ -1146,7 +1146,7 @@ class MGRPOTrainer(Trainer):
 
         binary_rewards = (solution_rewards > 0).float()
         #draft_rewards = binary_rewards * traj_ent
-        draft_rewards = solution_rewards.copy()
+        draft_rewards = solution_rewards.clone().detach()
 
         # Compute grouped-wise rewards
         draft_mean_grouped_rewards = draft_rewards.view(-1, self.num_generations).mean(dim=1)
