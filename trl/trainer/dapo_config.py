@@ -21,9 +21,9 @@ from transformers import TrainingArguments
 
 
 @dataclass
-class GRPOConfig(TrainingArguments):
+class DAPOConfig(TrainingArguments):
     r"""
-    Configuration class for the [`GRPOTrainer`].
+    Configuration class for the [`DAPOTrainer`].
 
     Only the parameters specific to GRPO training are listed here. For details on other parameters, refer to the
     [`~transformers.TrainingArguments`] documentation.
@@ -37,7 +37,7 @@ class GRPOConfig(TrainingArguments):
 
         model_init_kwargs (`str`, `dict[str, Any]` or `None`, *optional*, defaults to `None`):
             Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
-            argument of the [`GRPOTrainer`] is provided as a string.
+            argument of the [`DAPOTrainer`] is provided as a string.
         disable_dropout (`bool`, *optional*, defaults to `False`):
             Whether to disable dropout in the model. This is useful for training with a reference model, as it
             prevents the model from generating different logprobs for the same input.
@@ -177,7 +177,7 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
-            "argument of the `GRPOTrainer` is provided as a string."
+            "argument of the `DAPOTrainer` is provided as a string."
         },
     )
     disable_dropout: bool = field(
@@ -324,7 +324,7 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "Epsilon value for clipping."},
     )
     epsilon_high: Optional[float] = field(
-        default=None,
+        default=0.28,
         metadata={
             "help": "Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the "
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."

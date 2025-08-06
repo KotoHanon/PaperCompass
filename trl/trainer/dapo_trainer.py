@@ -53,7 +53,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
-from .grpo_config import GRPOConfig
+from .dapo_config import DAPOConfig
 from .utils import (
     disable_dropout_in_model,
     generate_model_card,
@@ -75,7 +75,8 @@ from utils.functions.common_functions import truncate_tokens
 from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 from .training_adapter import adaption_layer
-from .training_adapter_vllm import adaption_layer_vllm 
+from .training_adapter_vllm import adaption_layer_vllm
+from ..core import masked_mean
 import logging, json, tiktoken
 
 
@@ -269,7 +270,7 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     return torch.max(tensor[~torch.isnan(tensor)])
 
 
-class GRPOTrainer(Trainer):
+class DAPOTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
@@ -278,7 +279,7 @@ class GRPOTrainer(Trainer):
 
     ```python
     from datasets import load_dataset
-    from trl import GRPOTrainer
+    from trl import DAPOTrainer
 
     dataset = load_dataset("trl-lib/tldr", split="train")
 
@@ -286,7 +287,7 @@ class GRPOTrainer(Trainer):
         # Dummy reward function that rewards completions with more unique letters.
         return [float(len(set(completion))) for completion in completions]
 
-    trainer = GRPOTrainer(
+    trainer = DAPOTrainer(
         model="Qwen/Qwen2-0.5B-Instruct",
         reward_funcs=reward_func,
         train_dataset=dataset,
@@ -325,7 +326,7 @@ class GRPOTrainer(Trainer):
                   [Using a custom reward function](#using-a-custom-reward-function).
             - A list of reward functions, where each item can independently be any of the above types. Mixing different
             types within the list (e.g., a string model ID and a custom reward function) is allowed.
-        args ([`GRPOConfig`], *optional*, defaults to `None`):
+        args ([`DAPOConfig`], *optional*, defaults to `None`):
             Configuration for this trainer. If `None`, a default configuration is used.
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
             Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset is
@@ -369,7 +370,7 @@ class GRPOTrainer(Trainer):
         self,
         model: Union[str, PreTrainedModel],
         solution_reward_funcs: Union[RewardFunc, list[RewardFunc]],
-        args: Optional[GRPOConfig] = None,
+        args: Optional[DAPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[PreTrainedTokenizerBase] = None,
@@ -398,7 +399,7 @@ class GRPOTrainer(Trainer):
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
-            args = GRPOConfig(f"{model_name}-GRPO")
+            args = DAPOConfig(f"{model_name}-GRPO")
 
         # Models
         # Trained model
@@ -414,7 +415,7 @@ class GRPOTrainer(Trainer):
                 model_init_kwargs["torch_dtype"] = torch_dtype
             else:
                 raise ValueError(
-                    "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                    "Invalid `torch_dtype` passed to `DAPOConfig`. Expected either 'auto' or a string representing "
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
@@ -427,7 +428,7 @@ class GRPOTrainer(Trainer):
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
                 raise ValueError(
-                    "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                    "You passed `model_init_kwargs` to the `DAPOConfig`, but your model is already instantiated. "
                     "This argument can only be used when the `model` argument is a string."
                 )
 
@@ -566,7 +567,7 @@ class GRPOTrainer(Trainer):
         ):
             # See https://github.com/huggingface/trl/issues/3213
             raise NotImplementedError(
-                "Iterable datasets are not yet supported in GRPOTrainer. Please use a standard dataset instead."
+                "Iterable datasets are not yet supported in DAPOTrainer. Please use a standard dataset instead."
             )
 
         # Multi-step
@@ -790,7 +791,7 @@ class GRPOTrainer(Trainer):
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
-        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
+        # In DAPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
@@ -879,7 +880,7 @@ class GRPOTrainer(Trainer):
             seed=self.args.seed,
         )
 
-    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
+    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: DAPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
         model.config.use_cache = False
@@ -1273,7 +1274,7 @@ class GRPOTrainer(Trainer):
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
+            raise ValueError("The DAPOTrainer does not support returning outputs")
         if self.use_liger_loss:
             # Compute the loss using the liger grpo loss
             return self.compute_liger_loss(model, inputs)
@@ -1334,10 +1335,9 @@ class GRPOTrainer(Trainer):
         solution_per_token_loss2 = solution_coef_2 * solution_advantages.unsqueeze(1)
         solution_per_token_loss = -torch.min(solution_per_token_loss1, solution_per_token_loss2)
         
-        loss = (((draft_per_token_loss * draft_mask).sum(-1)) + ((solution_per_token_loss * completion_mask).sum(-1))) / (torch.cat([draft_mask,completion_mask],dim=1).sum().clamp(min=1.0))
-
-        #loss = ((solution_per_token_loss * completion_mask).sum(-1)) / (completion_mask.sum(-1).clamp(min=1.0).mean())
-
+        completion_mask = torch.cat([draft_mask, completion_mask], dim=1)
+        loss = masked_mean(per_token_logps, completion_mask) # token-level loss.
+        
         # Log the metrics
         mode = "train" if self.model.training else "eval"
 

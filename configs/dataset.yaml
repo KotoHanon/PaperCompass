@@ -1,9 +1,0 @@
-dataset_name: airqa
-db: ai_research
-database_dir: data/database/ai_research/
-db_type: duckdb
-vectorstore: ${db}
-launch_method: standalone
-docker_uri: http://127.0.0.1:19530
-vectorstore_dir: data/vectorstore/ai_research/
-test_data: test_data.jsonl
