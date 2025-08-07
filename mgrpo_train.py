@@ -51,7 +51,7 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         max_completion_length=cfg.max_completion_length,
-        max_draft_length = cfg.max_draft_length,
+        #max_draft_length = cfg.max_draft_length,
         max_prompt_length=cfg.max_prompt_length,
         max_steps=cfg.max_steps,
         bf16=True,
@@ -71,7 +71,7 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
     trainer = MGRPOTrainer(
         model=model,
         args=args,
-        solution_reward_funcs=[correct_reward_router_without_llm],
+        reward_funcs=[correct_reward_router_without_llm],
         train_dataset=train_dataset,
         agent_method=cfg.method,
         max_turn=cfg.max_turn,
