@@ -67,6 +67,9 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
         beta=0.0,
         max_grad_norm=cfg.max_grad_norm,
         num_iterations=cfg.num_iterations,
+        epsilon_high=cfg.epsilon_high,
+        mask_truncated_completions=True, # Overlong Filtering
+        
     )
 
     trainer = DAPOTrainer(
