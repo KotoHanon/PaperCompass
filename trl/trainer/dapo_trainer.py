@@ -53,7 +53,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..import_utils import is_liger_kernel_available, is_rich_available, is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
-from .mgrpo_config import DAPOConfig
+from .dapo_config import DAPOConfig
 from .utils import (
     disable_dropout_in_model,
     generate_model_card,
