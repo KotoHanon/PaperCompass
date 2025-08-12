@@ -35,3 +35,4 @@ logging_dir: ./tensorboardlogging/Qwen2.5-3B-MGRPO
 logging_steps: 1
 max_grad_norm : 10.0
 num_iterations: 5
+epsilon_high: 0.28
