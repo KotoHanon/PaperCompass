@@ -38,7 +38,6 @@ def eval_string_fuzzy_match(
 
 def tokenize(text: str) -> List[str]:
     text = text.lower()
-    # 移除非字母数字字符
     text = re.sub(r'[^\w\s]', '', text)
     return text.split()
 
