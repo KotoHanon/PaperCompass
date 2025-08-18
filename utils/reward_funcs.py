@@ -36,6 +36,12 @@ def eval_string_fuzzy_match(
             pred, gold = re.sub(r'\s+', '', pred), re.sub(r'\s+', '', gold)
     return float(fuzz_function(pred.lower(), gold.lower()) >= threshold) if lowercase else float(fuzz_function(pred, gold) >= threshold)
 
+def tokenize(text: str) -> List[str]:
+    text = text.lower()
+    # 移除非字母数字字符
+    text = re.sub(r'[^\w\s]', '', text)
+    return text.split()
+
 def eval_string_f1_match(
         pred: str,
         gold: str,
@@ -60,7 +66,7 @@ def eval_string_f1_match(
             pred, gold = re.sub(r'\s+', ' ', pred), re.sub(r'\s+', ' ', gold)
         else:
             pred, gold = re.sub(r'\s+', '', pred), re.sub(r'\s+', '', gold)
-    f1_score = (fuzz_function(pred, gold) * min(len(pred), len(gold))) / (len(pred) + len(gold))
+    f1_score = (fuzz_function(pred, gold) * min(len(tokenize(pred)), len(tokenize(gold)))) / (100*(len(tokenize(pred)) + len(tokenize(gold))))
     return f1_score
 
 
