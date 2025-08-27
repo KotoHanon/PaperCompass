@@ -83,7 +83,7 @@ def get_completion_mask(trainer, completion_ids):
 
     return completion_mask, is_eos
 
-def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     trainer.messages = []
 
     for idx, example in enumerate(inputs):
@@ -105,8 +105,8 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
         ])
     
     messages_with_drafts, drafts_texts, draft_ids = draft_generation(trainer=trainer, prepare_input_function=prepare_input_function, draft_prompt=draft_prompt, messages=trainer.messages, logger=logger)
-    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=messages_with_drafts, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
-    #completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
+    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=messages_with_drafts, window_size=window_size, logger=logger)
+    #completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, logger=logger)
 
     completion_mask, is_eos = get_completion_mask(trainer, completion_ids)
     draft_mask = get_completion_mask(trainer, draft_ids)[0]
@@ -169,7 +169,7 @@ def draft_generation(trainer, prepare_input_function, draft_prompt, messages: Li
 
     return new_messages, draft_texts, draft_ids
 
-def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.env.reset()
     batch_size = len(messages)
     prompt_completion_ids_list = [[] for _ in range(batch_size)]
