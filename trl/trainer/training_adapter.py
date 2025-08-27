@@ -92,11 +92,6 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             if idx == 0:
                 logger.info(f'[Task Prompt]: {task_prompt}')
 
-        '''task_prompt = "\n".join([
-            task_prompt,
-            f"[Database Schema]: {trainer.database_prompt}",
-            f"[Vectorstore Schema]: {trainer.vectorstore_prompt}"
-        ])'''
         if image_messages:
             task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
         trainer.messages.append([
