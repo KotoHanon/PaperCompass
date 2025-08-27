@@ -2,9 +2,8 @@
 
 VLLM_EVAL_MODEL_PATH=""
 VLLM_EVAL_SERVED_MODEL_NAME=""
-VLLM_EVAL_API_KEY=""
 VLLM_EVAL_PORT=8000
-VLLM_EVAL_GPUS="0"
+VLLM_EVAL_NPUS="0"
 VLLM_TP_SIZE=1
 VLLM_GPU_MEM_UTIL=0.8
 VLLM_EVAL_LOG_FILE=""
@@ -47,7 +46,7 @@ start_eval_vllm() {
 
     echo "Starting vLLM server with command:"
     # shellcheck disable=SC2086
-    ASCEND_VISIBLE_DEVICES=${VLLM_EVAL_GPUS} python -m vllm.entrypoints.openai.api_server "${VLLM_CMD_ARGS[@]}" > "${VLLM_EVAL_LOG_FILE}" 2>&1 &
+    ASCEND_VISIBLE_DEVICES=${VLLM_EVAL_NPUS} python -m vllm.entrypoints.openai.api_server "${VLLM_CMD_ARGS[@]}" > "${VLLM_EVAL_LOG_FILE}" 2>&1 &
     VLLM_PID=$!
 
     sleep 120
@@ -59,9 +58,9 @@ start_eval_vllm() {
 }
 
 start_evaling() {
-    export VLLM_SUP_API_KEY="lococo_sup"
+    export VLLM_EVAL_API_KEY="your_eval_api_name"
     export VLLM_EVAL_BASE_URL="http://localhost:${VLLM_EVAL_PORT}/v1"
-    python scripts/hybrid_neural_symbolic_rag_g1.py --dataset airqa --test_data test_data_553.jsonl --database ai_research --agent_method neusym_rag --llm qwen2.5-3b-ckpt 
+    python scripts/hybrid_neural_symbolic_rag.py --dataset airqa --test_data test_data_553.jsonl --database ai_research --agent_method neusym_rag --llm your_eval_model
     TRAINING_EXIT_CODE=$?
 }
 
