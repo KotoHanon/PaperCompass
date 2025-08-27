@@ -18,10 +18,6 @@ result_dir: str = get_result_folder(args)
 logger: Logger = get_result_logger(result_dir)
 llm: LLMClient = infer_model_class(args.llm)(image_limit=args.image_limit, length_limit=args.length_limit)
 
-args.test_data = "eval_data.jsonl"
-args.database_path = "/aistor/sjtu/hpc_stor01/home/wangzijian/workspace/NeuSym-RAG/data/database/ai_research/ai_research.14017.1.duckdb"
-args.vectorstore_path = "/aistor/sjtu/hpc_stor01/home/wangzijian/workspace/NeuSym-RAG/data/vectorstore/ai_research/ai_research.14017.1.db"
-
 env: AgentEnv = infer_env_class(args.agent_method)(
     dataset=args.dataset,
     action_format=args.action_format,
