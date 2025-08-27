@@ -61,7 +61,7 @@ from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 import logging, json, tiktoken
 
-def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.messages = []
     NEUSYM_RAG_SYSTEM_PROMPT = """You are an intelligent agent with expertise in **retrieving useful context from both the DuckDB database and the Milvus vectorstore through SQL execution and similarity search** and **answering user questions**. You will be given a natural language question concerning PDF files, along with the schema of both the database and the vectorstore. Your ultimate goal is to answer the input question with pre-defined answer format. The DuckDB database contains all parsed content of raw PDF files, while the Milvus vectorstore encodes specific column cells from the database as vectors. You can predict executable actions, interact with the hybrid environment (including database and vectorstore) across multiple turns, and retrieve necessary context until you are confident in resolving the question.
 [Database Schema]: A detailed serialized schema of the DuckDB database for reference when generating SQL queries. It includes 1) tables, 2) columns and their data types, 3) descriptions for these schema items, and 4) primary key and foreign key constraints.
@@ -86,7 +86,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             {'role': 'user', 'content': task_prompt}
         ])
 
-    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, use_consistency_selection=False, consistency_N=1, logger=logger)
+    completions_texts, prompt_completion_ids, completion_ids, prompt_ids, prompt_mask = interact(trainer, prepare_input_function=prepare_input_function, messages=trainer.messages, window_size=window_size, logger=logger)
 
     # we pad for: 1. everyone after the first eos token, and 2. pad_token_id for the rest
     is_eos = completion_ids == trainer.processing_class.eos_token_id
@@ -117,7 +117,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
     return completions_texts, prompt_completion_ids, completion_ids, attention_mask, completion_mask, is_eos
 
 
-def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, use_consistency_selection: bool = False, consistency_N: int = 5, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     trainer.env.reset()
     batch_size = len(messages)
     prompt_completion_ids_list = [[] for _ in range(batch_size)]
@@ -202,7 +202,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
             for idx in range(batch_size):
                 prompt_completion_ids_list[idx].append(completion_ids[idx]) # we just record the initial prompt
                 completion_ids_list[idx].append(completion_ids[idx])
-
         else:
             for idx in range(batch_size):
                 if idx not in active_idx: continue
@@ -254,9 +253,9 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        if len(prompt_completion_ids_list[idx]) >= 10:
-            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-10:]
-            completion_ids_list[idx] = completion_ids_list[idx][-10:]
+        if len(prompt_completion_ids_list[idx]) >= 5:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-5:]
+            completion_ids_list[idx] = completion_ids_list[idx][-5:]
         
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
 
