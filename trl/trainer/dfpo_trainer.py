@@ -1053,14 +1053,14 @@ class DFPOTrainer(Trainer):
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        truncate_pc_ids = prompt_completion_ids[:,-(1000 + draft_ids.size(1) + completion_ids.size(1)):]
+        prompt_completion_ids = prompt_completion_ids[:,-(1000 + draft_ids.size(1) + completion_ids.size(1)):]
 
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                 )
             else:
                 old_per_token_logps = None
@@ -1069,12 +1069,12 @@ class DFPOTrainer(Trainer):
                 ref_per_token_logps = None
             elif self.ref_model is not None:
                 ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.ref_model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.model, truncate_pc_ids, attention_mask, logits_to_keep, batch_size
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                     )
 
         if is_conversational(inputs[0]):
@@ -1136,7 +1136,7 @@ class DFPOTrainer(Trainer):
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the draft tokens and completion tokens
         #per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=True)
         #logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, truncate_pc_ids, attention_mask, logits_to_keep, compute_entropy=True)
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=True)
 
         draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
     
