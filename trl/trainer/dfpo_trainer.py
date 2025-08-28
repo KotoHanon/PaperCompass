@@ -1053,8 +1053,6 @@ class DFPOTrainer(Trainer):
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        prompt_completion_ids = prompt_completion_ids[:,-(1000 + draft_ids.size(1) + completion_ids.size(1)):]
-
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
