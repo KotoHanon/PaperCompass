@@ -1231,8 +1231,10 @@ class DAPOTrainer(Trainer):
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
+            "prompt_completion_ids": prompt_completion_ids,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "attention_mask": attention_mask,
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
@@ -1333,10 +1335,12 @@ class DAPOTrainer(Trainer):
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        prompt_completion_ids = inputs["prompt_completion_ids"]
+        #attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        attention_mask = inputs["attention_mask"]
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, compute_entropy=True)
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=True)
 
         solution_entropies = entropies[:, -logits_to_keep:]
 
