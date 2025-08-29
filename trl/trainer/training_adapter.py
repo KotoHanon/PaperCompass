@@ -61,7 +61,7 @@ from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 import logging, json, tiktoken
 
-def replace_all_but_last_eos(tensor, batch_size, eos_token_id, pad_token_id):
+def replace_all_but_last_eos(tensor, batch_size: int, eos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
     if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
         for batch_idx in range(batch_size):
             eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
@@ -70,7 +70,16 @@ def replace_all_but_last_eos(tensor, batch_size, eos_token_id, pad_token_id):
                     tensor[batch_idx, pos] = pad_token_id
     return tensor
 
-def get_completion_mask(trainer, completion_ids):
+def replace_all_but_first_bos(tensor, batch_size: int, bos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
+        for batch_idx in range(batch_size):
+            bos_positions = (tensor[batch_idx] == bos_token_id).nonzero(as_tuple=True)[0]
+            if len(bos_positions) > 1: 
+                for pos in bos_positions[1:]:
+                    tensor[batch_idx, pos] = pad_token_id
+    return tensor
+
+def get_completion_mask(trainer, completion_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # we pad for: 1. everyone after the first eos token, and 2. pad_token_id for the rest
     is_eos = completion_ids == trainer.processing_class.eos_token_id
     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=trainer.accelerator.device)
@@ -92,6 +101,11 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
             if idx == 0:
                 logger.info(f'[Task Prompt]: {task_prompt}')
 
+        '''task_prompt = "\n".join([
+            task_prompt,
+            f"[Database Schema]: {trainer.database_prompt}",
+            f"[Vectorstore Schema]: {trainer.vectorstore_prompt}"
+        ])'''
         if image_messages:
             task_prompt = [{'type': 'text', 'text': task_prompt}] + image_messages
         trainer.messages.append([
@@ -122,7 +136,7 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
 
     return completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos
 
-def draft_generation(trainer, prepare_input_function, draft_prompt, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None):
+def draft_generation(trainer, prepare_input_function, draft_prompt: str, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None) -> Tuple[List[List[Dict[str, Any]]], List[str], torch.Tensor]:
     # generate the draft.
     prompt_texts = []
     for message in messages:
@@ -150,7 +164,7 @@ def draft_generation(trainer, prepare_input_function, draft_prompt, messages: Li
                 prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=trainer.draft_config)
 
     prompt_length = prompt_ids.size(1)
-    draft_ids = prompt_completion_ids[:, prompt_length:]   
+    draft_ids = prompt_completion_ids[:, prompt_length:]
     draft_texts = trainer.processing_class.batch_decode(draft_ids, skip_special_tokens=True)
 
     # assign each draft text to the corresponding message
@@ -179,7 +193,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     active_mask = [True] * batch_size
     obss = [[] for _ in range(batch_size)] # [batch_size, num_turn]
     
-
     for turn in range(trainer.max_turn):
         if sum(active_mask) == 0: # exit if all samples have completed the task
             if trainer.accelerator.is_main_process:
@@ -202,10 +215,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 default_prompt = "system: An error occurred while processing the previous turn."
                 prompt_texts.append(default_prompt)
                 logger.warning(f"Error in converting message: {e}")
-        
-        '''prompt_inputs = trainer.processing_class(
-            text=prompt_texts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )'''
+
         prompt_inputs = trainer.processing_class(
             text=prompt_texts, return_tensors="pt", padding=True, add_special_tokens=False, padding_side="left"
         )
@@ -248,7 +258,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
 
         if turn == 0:
             for idx in range(batch_size):
-                prompt_completion_ids_list[idx].append(completion_ids[idx]) # we just record the initial prompt
+                prompt_completion_ids_list[idx].append(completion_ids[idx])
                 completion_ids_list[idx].append(completion_ids[idx])
 
         else:
@@ -258,6 +268,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                     prompt_completion_ids_list[idx].append(completion_ids[idx])
                     completion_ids_list[idx].append(completion_ids[idx])
         
+        completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True) # decode again, since we add pad tokens for inactive samples
         completion_texts = [text + "[/Action]" for text in completion_texts]
         full_completion_texts.append(completion_texts)
             
@@ -279,7 +290,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 action_msgs.append(actions[active_idx.index(idx)].convert_to_message(trainer.env.action_format, trainer.env.interact_protocol))
 
         if trainer.accelerator.is_main_process:
-            logger.info(f"[Action]:{actions[0]}")
+            logger.info(f"[Action]:{actions[0] if actions[0] is not None else 'None'}")
             logger.info(f"[Observation]:{obs_msgs[0]['content'] if obs_msgs[0] is not None else 'None'}")
 
         # update history messages
@@ -293,7 +304,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
             for m in messages:
                 f.write(json.dumps(m, ensure_ascii=False) + '\n')
 
-    # keep the last valid observation for each sample as the prev_answer
+    # keep the last valid observation for each sample as the pred_answer
     real_obss = [] # [batch_size]
     for idx_1 in range(batch_size):
         for idx_2 in reversed(range(len(obss[idx_1]))):
@@ -325,12 +336,24 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
             trainer.processing_class.eos_token_id, 
             trainer.processing_class.pad_token_id
         )
+        first_dim_flattened_completion_ids = replace_all_but_first_bos(
+            first_dim_flattened_completion_ids, 
+            batch_size,
+            trainer.processing_class.bos_token_id, 
+            trainer.processing_class.pad_token_id
+        )
     
     if first_dim_flattened_completion_ids.numel() > 0:
         first_dim_flattened_completion_ids = replace_all_but_last_eos(
             first_dim_flattened_completion_ids, 
             batch_size,
             trainer.processing_class.eos_token_id, 
+            trainer.processing_class.pad_token_id
+        )
+        first_dim_flattened_completion_ids = replace_all_but_first_bos(
+            first_dim_flattened_completion_ids, 
+            batch_size,
+            trainer.processing_class.bos_token_id, 
             trainer.processing_class.pad_token_id
         )
 
@@ -341,9 +364,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
     logger.info(f'[Pred from {trainer.accelerator.process_index}]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
     completion_texts = [''.join(column) for column in zip(*full_completion_texts)] # concatenate the completion texts for each sample
     completion_texts = [text + "\n" + "[Observation]: " + truncate_tokens(str(obs.obs_content)) + "[/Observation]" for text, obs in zip(completion_texts, real_obss)]
-
-    if trainer.accelerator.is_main_process:
-        logger.info(f'[Completion Texts]: {completion_texts}')
         
     return completion_texts, first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids, initial_prompt_ids, initial_prompt_mask
 
