@@ -1031,21 +1031,6 @@ class DFPOTrainer(Trainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = self.processing_class(
-            text=prompts_text, return_tensors="pt", padding=True, add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-
         # Generate completions using either vLLM or regular generation
         assert self.use_vllm == False, "vLLM is not supported in DFPOTrainer for now."
         completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos = adaption_layer(self, inputs, window_size=self.window_size, logger=logger, prepare_input_function=super()._prepare_inputs)
@@ -1130,7 +1115,6 @@ class DFPOTrainer(Trainer):
         #draft_rewards = (draft_rewards_per_func * self.draft_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
         solution_rewards = (solution_rewards_per_func * self.solution_reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # TODO : 3B or 7B
         logits_to_keep = draft_ids.size(1) + completion_ids.size(1)  # we only need to compute the logits for the draft tokens and completion tokens
         #per_token_logps, entropies = self._get_per_token_logps_and_entropies(self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=True)
         #logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
@@ -1217,8 +1201,6 @@ class DFPOTrainer(Trainer):
             self._textual_logs["rewards"][name].extend(solution_rewards_per_func[:, i].tolist())
 
         return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "draft_ids": draft_ids,
@@ -1277,12 +1259,9 @@ class DFPOTrainer(Trainer):
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
-
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         draft_ids, draft_mask = inputs["draft_ids"], inputs["draft_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         per_token_logps = inputs["per_token_logps"]
         draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
         solution_per_token_logps = per_token_logps[:, draft_ids.size(1):]
