@@ -17,7 +17,7 @@ from trl.trainer.dfpo_trainer import DFPOTrainer
 from trl.trainer.dfpo_config import DFPOConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from functools import wraps
-from utils.reward_funcs import correct_reward_router_with_llm, correct_reward_router_without_llm, repetition_penalty
+from utils.reward_funcs import correct_reward_router_with_llm, correct_reward_router_without_llm
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -64,14 +64,14 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
         logging_dir=cfg.logging_dir,
         logging_steps=cfg.logging_steps,
         do_eval=False,
-        beta=0.0,
+        beta=0.0, # without KL constraint
         max_grad_norm=cfg.max_grad_norm,
     )
 
     trainer = DFPOTrainer(
         model=model,
         args=args,
-        solution_reward_funcs=[correct_reward_router_without_llm],
+        solution_reward_funcs=[correct_reward_router_llm],
         train_dataset=train_dataset,
         agent_method=cfg.method,
         max_turn=cfg.max_turn,
