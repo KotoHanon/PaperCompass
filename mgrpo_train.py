@@ -17,7 +17,7 @@ from trl.trainer.mgrpo_trainer import MGRPOTrainer
 from trl.trainer.mgrpo_config import MGRPOConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from functools import wraps
-from utils.reward_funcs import correct_reward_router_with_llm, correct_reward_router_without_llm, repetition_penalty
+from utils.reward_funcs import correct_reward_router_with_llm, correct_reward_router_without_llm
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
