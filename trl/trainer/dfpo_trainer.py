@@ -464,7 +464,6 @@ class DFPOTrainer(Trainer):
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
-            '''processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path)'''
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
         
@@ -608,18 +607,7 @@ class DFPOTrainer(Trainer):
                 temperature=self.temperature,
                 use_ref_model=self.ref_model is not None,
             )
-
-        '''super().__init__(
-            model=model,
-            args=args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            callbacks=callbacks,
-            optimizers=optimizers,
-        )'''
-
+        
         super().__init__(
             model=model,
             args=args,
@@ -1122,10 +1110,10 @@ class DFPOTrainer(Trainer):
 
         draft_per_token_logps = per_token_logps[:, :draft_ids.size(1)]
     
-        traj_ent = draft_per_token_logps.mean(dim=-1)
+        traj_ent = -draft_per_token_logps.mean(dim=-1)
 
         binary_rewards = (solution_rewards > 0).float()
-        draft_rewards = binary_rewards * traj_ent
+        draft_rewards = -binary_rewards * traj_ent
 
         # Compute grouped-wise rewards
         draft_mean_grouped_rewards = draft_rewards.view(-1, self.num_generations).mean(dim=1)
