@@ -71,7 +71,7 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
     trainer = MGRPOTrainer(
         model=model,
         args=args,
-        reward_funcs=[correct_reward_router_without_llm],
+        reward_funcs=[correct_reward_router_with_llm],
         train_dataset=train_dataset,
         agent_method=cfg.method,
         max_turn=cfg.max_turn,
