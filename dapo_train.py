@@ -75,7 +75,7 @@ def neusym_rag_rl(cfg: DictConfig) -> None:
     trainer = DAPOTrainer(
         model=model,
         args=args,
-        solution_reward_funcs=[correct_reward_router_without_llm],
+        solution_reward_funcs=[correct_reward_router_with_llm],
         train_dataset=train_dataset,
         agent_method=cfg.method,
         max_turn=cfg.max_turn,
