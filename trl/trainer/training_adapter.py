@@ -67,7 +67,7 @@ def replace_all_but_last_eos(tensor, batch_size: int, eos_token_id: torch.Tensor
             comparison = (tensor[batch_idx] == eos_token_id)
             if isinstance(comparison, bool):
                 continue
-                
+
             eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
             if len(eos_positions) > 1: 
                 for pos in eos_positions[:-1]:
@@ -330,50 +330,50 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
     
-    #first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
-    #first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
-        
     first_dim_flattened_prompt_completion_ids = pad_sequence(prompt_completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
     first_dim_flattened_completion_ids = pad_sequence(completion_ids_list, batch_first=True, padding_value=trainer.processing_class.pad_token_id, padding_side='left')
-    # only keep the last EOS token in each sample, replace others with PAD token
-    
+
+    first_dim_flattened_completion_ids = first_dim_flattened_completion_ids.view(-1, first_dim_flattened_completion_ids.size(-1)) # [batch_size, padding_size]
+    first_dim_flattened_prompt_completion_ids = first_dim_flattened_prompt_completion_ids.view(-1, first_dim_flattened_prompt_completion_ids.size(-1)) # [batch_size, padding_size]
+
+
+    # only keep the last EOS token and first BOS token in each trajectory, replace others with PAD token
     if first_dim_flattened_prompt_completion_ids.numel() > 0:
-        first_dim_flattened_prompt_completion_ids = replace_all_but_last_eos(
+        first_dim_flattened_prompt_completion_ids_clear_eos = replace_all_but_last_eos(
             first_dim_flattened_prompt_completion_ids, 
             batch_size,
             trainer.processing_class.eos_token_id, 
             trainer.processing_class.pad_token_id
         )
-        first_dim_flattened_completion_ids = replace_all_but_first_bos(
-            first_dim_flattened_completion_ids, 
+        first_dim_flattened_prompt_completion_ids_clear_eos_bos = replace_all_but_first_bos(
+            first_dim_flattened_prompt_completion_ids_clear_eos, 
             batch_size,
             trainer.processing_class.bos_token_id, 
             trainer.processing_class.pad_token_id
         )
     
     if first_dim_flattened_completion_ids.numel() > 0:
-        first_dim_flattened_completion_ids = replace_all_but_last_eos(
+        first_dim_flattened_completion_ids_clear_eos = replace_all_but_last_eos(
             first_dim_flattened_completion_ids, 
             batch_size,
             trainer.processing_class.eos_token_id, 
             trainer.processing_class.pad_token_id
         )
-        first_dim_flattened_completion_ids = replace_all_but_first_bos(
-            first_dim_flattened_completion_ids, 
+        first_dim_flattened_completion_ids_clear_eos_bos = replace_all_but_first_bos(
+            first_dim_flattened_completion_ids_clear_eos, 
             batch_size,
             trainer.processing_class.bos_token_id, 
             trainer.processing_class.pad_token_id
         )
 
     if trainer.accelerator.is_main_process:
-        print(first_dim_flattened_completion_ids.shape)
-        print(first_dim_flattened_prompt_completion_ids.shape)
+        print(first_dim_flattened_completion_ids_clear_eos_bos.shape)
+        print(first_dim_flattened_prompt_completion_ids_clear_eos_bos.shape)
     
-    logger.info(f'[Pred from {trainer.accelerator.process_index}]: {[truncate_tokens(str(obs.obs_content)) for obs in real_obss]}')
     completion_texts = [''.join(column) for column in zip(*full_completion_texts)] # concatenate the completion texts for each sample
     completion_texts = [text + "\n" + "[Observation]: " + truncate_tokens(str(obs.obs_content)) + "[/Observation]" for text, obs in zip(completion_texts, real_obss)]
         
-    return completion_texts, first_dim_flattened_prompt_completion_ids, first_dim_flattened_completion_ids, initial_prompt_ids, initial_prompt_mask
+    return completion_texts, first_dim_flattened_prompt_completion_ids_clear_eos_bos, first_dim_flattened_completion_ids_clear_eos_bos, initial_prompt_ids, initial_prompt_mask
 
 def crop_image_count_in_messages(
     trainer,
