@@ -1278,8 +1278,8 @@ class DFPOTrainer(Trainer):
         solution_advantages = inputs["solution_advantages"]
 
         # negative sample gradient masking
-        '''wrong_solution_idx = inputs["solution_rewards"] <= 0
-        draft_advantages[wrong_solution_idx] = solution_advantages[wrong_solution_idx]'''
+        wrong_solution_idx = inputs["solution_rewards"] <= 0
+        draft_advantages[wrong_solution_idx] = solution_advantages[wrong_solution_idx]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
         
