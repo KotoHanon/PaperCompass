@@ -1019,6 +1019,8 @@ class DFPOTrainer(Trainer):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
+        prompts = [x["prompt"] for x in inputs]
+
         # Generate completions using either vLLM or regular generation
         assert self.use_vllm == False, "vLLM is not supported in DFPOTrainer for now."
         completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos = adaption_layer(self, inputs, window_size=self.window_size, logger=logger, prepare_input_function=super()._prepare_inputs)
@@ -1183,7 +1185,6 @@ class DFPOTrainer(Trainer):
         self._metrics[mode]["solution_reward_std"].append(solution_std_grouped_rewards.mean().item())
 
         # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompts_text))
         self._textual_logs["completion"].extend(gather_object(completions_texts))
         for i, name in enumerate(self.solution_reward_func_names):
             self._textual_logs["rewards"][name].extend(solution_rewards_per_func[:, i].tolist())
