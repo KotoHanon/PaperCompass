@@ -64,6 +64,10 @@ import logging, json, tiktoken
 def replace_all_but_last_eos(tensor, batch_size: int, eos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
     if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
         for batch_idx in range(batch_size):
+            comparison = (tensor[batch_idx] == eos_token_id)
+            if isinstance(comparison, bool):
+                continue
+                
             eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
             if len(eos_positions) > 1: 
                 for pos in eos_positions[:-1]:
@@ -73,7 +77,11 @@ def replace_all_but_last_eos(tensor, batch_size: int, eos_token_id: torch.Tensor
 def replace_all_but_first_bos(tensor, batch_size: int, bos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
     if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
         for batch_idx in range(batch_size):
-            bos_positions = (tensor[batch_idx] == bos_token_id).nonzero(as_tuple=True)[0]
+            comparison = (tensor[batch_idx] == bos_token_id)
+            if isinstance(comparison, bool):
+                continue
+            
+            bos_positions = comparison.nonzero(as_tuple=True)[0]
             if len(bos_positions) > 1: 
                 for pos in bos_positions[1:]:
                     tensor[batch_idx, pos] = pad_token_id
