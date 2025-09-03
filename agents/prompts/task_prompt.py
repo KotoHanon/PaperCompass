@@ -60,4 +60,4 @@ def formulate_input(
         task_prompt = '\n'.join([question, answer_format, pdf_context, draft_prompt]).rstrip()
     else:
         task_prompt = '\n'.join([question, answer_format, pdf_context]).rstrip()
-    return task_prompt, image_messages
+    return task_prompt, image_messages, draft_prompt
