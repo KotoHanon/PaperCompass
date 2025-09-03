@@ -22,19 +22,6 @@ from utils.reward_funcs import correct_reward_router_with_llm, correct_reward_ro
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
-original_encode = tiktoken.core.Encoding.encode
-
-@wraps(original_encode)
-def patched_encode(self, text, *args, **kwargs):
-    if 'allowed_special' not in kwargs:
-        kwargs['allowed_special'] = "all" 
-    elif isinstance(kwargs['allowed_special'], set):
-        kwargs['allowed_special'].add('<|endoftext|>')
-
-    return original_encode(self, text, *args, **kwargs)
-
-tiktoken.core.Encoding.encode = patched_encode
-
 @hydra.main(config_path="configs", config_name="mgrpo_train_config", version_base=None)
 def neusym_rag_rl(cfg: DictConfig) -> None:
     train_dataset = load_data(cfg.test_data)
