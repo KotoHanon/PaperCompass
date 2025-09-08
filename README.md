@@ -77,6 +77,10 @@ In this stage, you need accomplish the following three steps: `Draft \& Tool-Use
 
 ## 📄 Draft & Tool-Use Fine-Tuning
 
+```
+llamafactory-cli train configs/dtft_config.yaml
+```
+
 ## 💪🏼 Draft-and-Follow Policy Optimization
 
 ### 1. API Key Configuration
