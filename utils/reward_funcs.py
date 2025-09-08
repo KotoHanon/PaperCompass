@@ -91,43 +91,6 @@ def parse_action(completion: str) -> List[str]:
     
     return [action.strip() for action in action_texts]
 
-
-def correct_reward_router_without_llm(prompts, completions, **reward_kwargs) -> List[float]:
-    rewards = []
-    for i, completion in enumerate(completions):
-        gold_str = reward_kwargs["gold_str"][i]
-        gold_answer = json.loads(gold_str)
-        pred_answer = parse_pred_answer(completion)
-        if str(pred_answer).startswith('[ERROR]:'): 
-            rewards.append(0.0)
-            continue
-    
-        function_name = gold_answer['evaluator']['eval_func']
-        eval_func = getattr(evaluation, function_name, None)
-        assert eval_func is not None, f"Evaluation function `{function_name}` not found in the evaluation module. Remember to import it in the evaluation/__init__.py file."
-        eval_kwargs = gold_answer['evaluator']['eval_kwargs']
-        if function_name == "eval_complex_math_formula_with_llm":
-            gold_answer = eval_kwargs["formulas"]
-            score = eval_string_fuzzy_match(
-                pred=pred_answer,
-                gold=gold_answer,
-            )
-        elif function_name == "eval_reference_answer_with_llm":
-            gold_answer = eval_kwargs["reference_answer"]
-            score = eval_string_fuzzy_match(
-                pred=pred_answer,
-                gold=gold_answer,
-            )
-        else:
-            try:
-                score = evaluate_airqa(pred_answer=pred_answer, gold=gold_answer)
-            except Exception as e:
-                score = 0.0
-
-        rewards.append(float(score))
-        # rewards.append(0.0)  # Placeholder for actual reward calculation'''
-    return rewards
-
 def correct_reward_router_with_llm(prompts, completions, **reward_kwargs) -> List[float]:
     rewards = []
     for i, completion in enumerate(completions):
@@ -138,20 +101,6 @@ def correct_reward_router_with_llm(prompts, completions, **reward_kwargs) -> Lis
         rewards.append(float(score))
         # rewards.append(0.0)  # Placeholder for actual reward calculation
     return rewards
-
-def repetition_penalty(prompts, completions, **reward_kwargs) -> List[float]:
-    penalties = []
-    penalty_coffecient = -0.1
-    for completion in completions:
-        action_list = parse_action(completion)
-        action_counts = Counter(action_list)
-        # Calculate the repetition penalty
-        try: # if the agent can not parse the action, it will return 10
-            max_repeats = max(action_counts.values())
-        except Exception as e:
-            max_repeats = 10
-        penalties.append(penalty_coffecient * (max_repeats - 1) if max_repeats > 1 else 0.0)
-    return penalties
 
 def acc_reward_f1(prompts, completions, **reward_kwargs) -> List[float]:
     rewards = []
