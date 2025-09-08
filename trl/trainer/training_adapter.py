@@ -277,7 +277,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                     completion_ids_list[idx].append(completion_ids[idx])
         
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True) # decode again, since we add pad tokens for inactive samples
-        completion_texts = [text + "[/Action]" for text in completion_texts]
         full_completion_texts.append(completion_texts)
             
         if trainer.accelerator.is_main_process:
