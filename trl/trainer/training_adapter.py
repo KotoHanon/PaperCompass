@@ -321,12 +321,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
-        if len(prompt_completion_ids_list[idx]) >= 5:
-            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-5:]
-            completion_ids_list[idx] = completion_ids_list[idx][-5:]
-        
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
-
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
     
