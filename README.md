@@ -118,7 +118,7 @@ db_type: duckdb
 vectorstore: ${db}
 launch_method: standalone
 vectorstore_dir: data/vectorstore/ai_research/
-test_data: train_data_400.jsonl
+test_data: <your_data>
 name: gpt-4o-mini
 model_name_or_path: <your_model_path>
 save_strategy: steps
