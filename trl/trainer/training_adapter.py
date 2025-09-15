@@ -88,6 +88,13 @@ def replace_all_but_first_bos(tensor, batch_size: int, bos_token_id: torch.Tenso
     return tensor
 
 def get_completion_mask(trainer, completion_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """ Padding operation.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        completion_ids: the generated completion ids.
+    @return
+        completion_mask.
+    """
     # we pad for: 1. everyone after the first eos token, and 2. pad_token_id for the rest
     is_eos = completion_ids == trainer.processing_class.eos_token_id
     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=trainer.accelerator.device)
@@ -101,6 +108,19 @@ def get_completion_mask(trainer, completion_ids: torch.Tensor) -> Tuple[torch.Te
     return completion_mask, is_eos
 
 def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """ The adaption layer between training and inference.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        inputs: current input format.
+        window_size: to control the context length.
+        output_path: to save the results.
+        output_kwargs: the kwargs for env.step().
+        logger: the logger to use.
+        prepare_input_function: to fix the input format.
+    @return
+        the interaction results.
+    """
+
     trainer.messages = []
 
     for idx, example in enumerate(inputs):
@@ -136,7 +156,6 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
     prompt_len = prompt_ids.size(1)
     completion_len = completion_ids.size(1)
 
-
     assert prompt_completion_len == prompt_len + completion_len, \
         f'Prompt completion length {prompt_completion_len} does not match the sum of prompt length {prompt_len} and completion length {completion_len}.'
 
@@ -145,6 +164,16 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
     return completions_texts, prompt_completion_ids, completion_ids, draft_ids, attention_mask, completion_mask, draft_mask, is_eos
 
 def draft_generation(trainer, prepare_input_function, draft_prompt: str, messages: List[List[Dict[str, Any]]], logger: logging.Logger = None) -> Tuple[List[List[Dict[str, Any]]], List[str], torch.Tensor]:
+    """ Generate the draft with given prompt.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        prepare_input_function: to fix the input format.
+        draft_prompt: the draft prompt to be set.
+        messages: the initial message the agent receives.
+        logger: the logger to use.
+    @return
+        the initial messages with drafts.
+    """
     # generate the draft.
     prompt_texts = []
     for message in messages:
@@ -187,6 +216,18 @@ def draft_generation(trainer, prepare_input_function, draft_prompt: str, message
     return new_messages, draft_texts, draft_ids
 
 def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ Interact with environment.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        prepare_input_function: to fix the input format.
+        messages: the initial message the agent receives.
+        window_size: to control the context length.
+        output_path: to save the results.
+        output_kwargs: the kwargs for env.step().
+        logger: the logger to use.
+    @return
+        the interaction results.
+    """
     trainer.env.reset()
     batch_size = len(messages)
     prompt_completion_ids_list = [[] for _ in range(batch_size)]
@@ -277,6 +318,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                     completion_ids_list[idx].append(completion_ids[idx])
         
         completion_texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True) # decode again, since we add pad tokens for inactive samples
+        completion_texts = [text + "[/Action]" for text in completion_texts]
         full_completion_texts.append(completion_texts)
             
         if trainer.accelerator.is_main_process:
@@ -312,7 +354,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 f.write(json.dumps(m, ensure_ascii=False) + '\n')
 
     # keep the last valid observation for each sample as the pred_answer
-    real_obss = [] # [batch_size]
+    real_obss = []
     for idx_1 in range(batch_size):
         for idx_2 in reversed(range(len(obss[idx_1]))):
             if obss[idx_1][idx_2] is not None:
@@ -320,7 +362,12 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 break
     
     for idx in range(batch_size):
+        if len(prompt_completion_ids_list[idx]) >= 5:
+            prompt_completion_ids_list[idx] = prompt_completion_ids_list[idx][-5:]
+            completion_ids_list[idx] = completion_ids_list[idx][-5:]
+        
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
+
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
     
@@ -329,7 +376,6 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
 
     first_dim_flattened_completion_ids = first_dim_flattened_completion_ids.view(-1, first_dim_flattened_completion_ids.size(-1)) # [batch_size, padding_size]
     first_dim_flattened_prompt_completion_ids = first_dim_flattened_prompt_completion_ids.view(-1, first_dim_flattened_prompt_completion_ids.size(-1)) # [batch_size, padding_size]
-
 
     # only keep the last EOS token and first BOS token in each trajectory, replace others with PAD token
     if first_dim_flattened_prompt_completion_ids.numel() > 0:
