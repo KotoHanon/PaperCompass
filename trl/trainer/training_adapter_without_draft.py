@@ -61,33 +61,37 @@ from agents.prompts import SYSTEM_PROMPTS, HINT_PROMPTS, AGENT_PROMPTS
 from agents.prompts.task_prompt import formulate_input
 import logging, json, tiktoken
 
+def replace_all_but_first_bos(tensor, batch_size: int, bos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
+        for batch_idx in range(batch_size):
+            bos_positions = (tensor[batch_idx] == bos_token_id).nonzero(as_tuple=True)[0]
+            if len(bos_positions) > 1: 
+                for pos in bos_positions[1:]:
+                    tensor[batch_idx, pos] = pad_token_id
+    return tensor
+
 def replace_all_but_last_eos(tensor, batch_size: int, eos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
     if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
         for batch_idx in range(batch_size):
-            comparison = (tensor[batch_idx] == eos_token_id)
-            if isinstance(comparison, bool):
-                continue
-                
             eos_positions = (tensor[batch_idx] == eos_token_id).nonzero(as_tuple=True)[0]
             if len(eos_positions) > 1: 
                 for pos in eos_positions[:-1]:
                     tensor[batch_idx, pos] = pad_token_id
     return tensor
 
-def replace_all_but_first_bos(tensor, batch_size: int, bos_token_id: torch.Tensor, pad_token_id: torch.Tensor) -> torch.Tensor:
-    if tensor.dim() == 2 and tensor.size(0) == batch_size:  # [batch_size, seq_len]
-        for batch_idx in range(batch_size):
-            comparison = (tensor[batch_idx] == bos_token_id)
-            if isinstance(comparison, bool):
-                continue
-            
-            bos_positions = comparison.nonzero(as_tuple=True)[0]
-            if len(bos_positions) > 1: 
-                for pos in bos_positions[1:]:
-                    tensor[batch_idx, pos] = pad_token_id
-    return tensor
-
 def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None, prepare_input_function = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ The adaption layer between training and inference.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        inputs: current input format.
+        window_size: to control the context length.
+        output_path: to save the results.
+        output_kwargs: the kwargs for env.step().
+        logger: the logger to use.
+        prepare_input_function: to fix the input format.
+    @return
+        the interaction results.
+    """
     trainer.messages = []
     for idx, example in enumerate(inputs):
         task_prompt, image_messages, _ = formulate_input(trainer.dataset, example, use_pdf_id=True)
@@ -139,6 +143,18 @@ def adaption_layer(trainer, inputs, window_size: int = 5, output_path: Optional[
 
 
 def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]]], window_size: int = 5, output_path: Optional[str] = None, output_kwargs: Dict[str, Any] = {}, logger: logging.Logger = None) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ Interact with environment.
+    @param
+        trainer: a 'trainer' class, e.g. DFPOTrainer.
+        prepare_input_function: to fix the input format.
+        messages: the initial message the agent receives.
+        window_size: to control the context length.
+        output_path: to save the results.
+        output_kwargs: the kwargs for env.step().
+        logger: the logger to use.
+    @return
+        the interaction results.
+    """
     trainer.env.reset()
     batch_size = len(messages)
     prompt_completion_ids_list = [[] for _ in range(batch_size)]
@@ -272,7 +288,7 @@ def interact(trainer, prepare_input_function, messages: List[List[Dict[str, Any]
                 real_obss.append(obss[idx_1][idx_2])
                 break
     
-    for idx in range(batch_size):
+    for idx in range(batch_size):        
         prompt_completion_ids_list[idx].insert(0, initial_prompt_ids[idx]) # insert the initial prompt at the beginning
         prompt_completion_ids_list[idx] = torch.cat(prompt_completion_ids_list[idx], dim=0)
         completion_ids_list[idx] = torch.cat(completion_ids_list[idx], dim=0)
