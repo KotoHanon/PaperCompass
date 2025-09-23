@@ -26,9 +26,6 @@
 ## 💻 Environment Setup
 First, prepare the corresponding conda environment and install dependencies.
 ```bash
-# Clone the PaperCompass repository (which includes our TRL)
-git clone https://github.com/KotoHanon/PaperCompass
-
 # Create a new conda environment
 conda create -n papercompass python=3.10
 conda activate papercompass
